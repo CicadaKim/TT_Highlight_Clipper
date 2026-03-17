@@ -1106,13 +1106,13 @@ def _roi_canvas_editor(art: Path, frame0_path: Path) -> None:
             with col_x:
                 px = st.number_input(
                     f"{labels[i]} X", 0, img_w,
-                    value=min(current_pts[i][0], img_w),
+                    value=max(0, min(current_pts[i][0], img_w)),
                     key=f"table_pt_{i}_x",
                 )
             with col_y:
                 py = st.number_input(
                     f"{labels[i]} Y", 0, img_h,
-                    value=min(current_pts[i][1], img_h),
+                    value=max(0, min(current_pts[i][1], img_h)),
                     key=f"table_pt_{i}_y",
                 )
             points.append([px, py])
