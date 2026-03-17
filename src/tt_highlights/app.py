@@ -24,6 +24,9 @@ _FRONTEND_DIR = Path(__file__).resolve().parent.parent.parent / "frontend"
 _video_editor_component = components.declare_component(
     "video_editor", path=str(_FRONTEND_DIR),
 )
+_roi_picker_component = components.declare_component(
+    "roi_picker", path=str(_FRONTEND_DIR / "roi_picker"),
+)
 
 st.set_page_config(page_title="TT Highlight Clipper", layout="wide")
 
@@ -1068,56 +1071,41 @@ def _render_explanation(result) -> None:
 # ─── ROI Canvas Editor ────────────────────────────────────────────────────────
 
 def _roi_canvas_editor(art: Path, frame0_path: Path) -> None:
-    """ROI editor using coordinate inputs (canvas-free for Streamlit compat)."""
-    from PIL import Image
-
-    st.markdown("**Manual ROI Editor**")
+    """ROI editor — click 4 points on image for table, inputs for scoreboard."""
+    import base64
 
     roi_path = art / "table_roi.json"
     sb_path = art / "scoreboard_roi.json"
 
-    # Load current values for defaults
-    current_pts = [[0, 0]] * 4
-    img = Image.open(str(frame0_path))
-    img_w, img_h = img.size
+    # Load current polygon
+    current_pts = []
     if roi_path.exists():
         with open(roi_path, "r") as f:
             current_roi = json.load(f)
-        current_pts = current_roi.get("table_polygon", current_pts)
+        current_pts = current_roi.get("table_polygon", [])
 
-    with st.expander("Edit Table ROI (4 corners)", expanded=False):
-        # Show overlay if available
-        overlay_path = Path(st.session_state.job_path).parent / "debug" / "frame0_overlay.png"
-        if overlay_path.exists():
-            st.image(str(overlay_path), caption="Current polygon (green) — edit below")
-        else:
-            st.image(str(frame0_path), caption="Frame 0")
+    # Read image dimensions + encode as base64 data URL
+    with open(str(frame0_path), "rb") as f:
+        img_bytes = f.read()
+    img_b64 = "data:image/jpeg;base64," + base64.b64encode(img_bytes).decode()
 
-        st.caption(f"Image size: {img_w} x {img_h}")
+    from PIL import Image
+    img = Image.open(str(frame0_path))
+    img_w, img_h = img.size
 
-        # Pad current_pts if needed
-        while len(current_pts) < 4:
-            current_pts.append([0, 0])
+    with st.expander("Edit Table ROI (4-point click)", expanded=True):
+        st.caption("이미지에서 테이블 꼭짓점 4개를 시계방향(좌상→우상→우하→좌하)으로 클릭하세요")
 
-        labels = ["Top-Left (0)", "Top-Right (1)", "Bottom-Right (2)", "Bottom-Left (3)"]
-        points = []
-        for i in range(4):
-            col_x, col_y = st.columns(2)
-            with col_x:
-                px = st.number_input(
-                    f"{labels[i]} X", 0, img_w,
-                    value=max(0, min(current_pts[i][0], img_w)),
-                    key=f"table_pt_{i}_x",
-                )
-            with col_y:
-                py = st.number_input(
-                    f"{labels[i]} Y", 0, img_h,
-                    value=max(0, min(current_pts[i][1], img_h)),
-                    key=f"table_pt_{i}_y",
-                )
-            points.append([px, py])
+        # ROI picker component
+        picker_value = _roi_picker_component(
+            image_b64=img_b64,
+            initial_points=current_pts,
+            key="roi_picker",
+            height=int(img_h * min(800, img_w) / img_w) + 60,
+        )
 
-        col_u1, col_u2 = st.columns(2)
+        # Action buttons
+        col_u1, col_u2, col_u3 = st.columns(3)
         with col_u1:
             if st.button("Use Auto Proposal", key="use_auto_table"):
                 try:
@@ -1127,7 +1115,22 @@ def _roi_canvas_editor(art: Path, frame0_path: Path) -> None:
                 except Exception as e:
                     st.error(f"Auto-detect failed: {e}")
         with col_u2:
-            if st.button("Save Manual Table ROI", key="save_manual_table"):
+            save_clicked = st.button(
+                "Save Table ROI", key="save_manual_table", type="primary",
+            )
+        with col_u3:
+            if current_pts:
+                st.caption(f"Current: {current_pts}")
+
+        if save_clicked:
+            points = None
+            if (picker_value and isinstance(picker_value, dict)
+                    and picker_value.get("complete")):
+                points = picker_value["points"]
+            elif current_pts and len(current_pts) == 4:
+                points = current_pts
+
+            if points and len(points) == 4:
                 roi_data = {
                     "table_polygon": points,
                     "polygon_order": "clockwise",
@@ -1139,10 +1142,11 @@ def _roi_canvas_editor(art: Path, frame0_path: Path) -> None:
                 with open(roi_path, "w", encoding="utf-8") as f:
                     json.dump(roi_data, f, indent=2)
                 _mark_setup_complete(art)
-                # Regenerate overlay with new polygon
                 _regenerate_overlay(frame0_path, points, art)
-                st.success("Manual table ROI saved!")
+                st.success("Table ROI saved!")
                 st.rerun()
+            else:
+                st.warning("4개 점을 모두 클릭한 뒤 저장하세요.")
 
     with st.expander("Edit Scoreboard ROI (rectangle)", expanded=False):
         current_sb = {"x": 0, "y": 0, "w": 0, "h": 0}
