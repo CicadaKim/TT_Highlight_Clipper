@@ -25,7 +25,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 /* ── Timeline ─────────────────────────────────────────── */
 .timeline-section { margin-top: 4px; }
 .timeline-canvas-wrap {
-  position: relative; width: 100%; height: 72px;
+  position: relative; width: 100%; min-height: 72px;
   background: #1a1d24; border-radius: 6px; overflow: hidden; cursor: crosshair;
 }
 .timeline-canvas-wrap canvas { position: absolute; top: 0; left: 0; }
@@ -72,6 +72,25 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
   border-radius: 4px; cursor: pointer; font-size: 11px; font-weight: 600; margin-left: auto;
 }
 .clip-clear-all:hover { background: #ff4b4b; color: #fff; }
+.clip-export {
+  background: #1a2a3a; border: 1px solid #4bafff; color: #4bafff; padding: 2px 7px;
+  border-radius: 4px; cursor: pointer; font-size: 10px; font-weight: 600;
+}
+.clip-export:hover { background: #4bafff; color: #fff; }
+.clip-export.gif { border-color: #4bff88; color: #4bff88; background: #1a3a1a; }
+.clip-export.gif:hover { background: #4bff88; color: #000; }
+
+/* ── Context Menu ──────────────────────────────────────── */
+.ctx-menu {
+  position: fixed; background: #1a1d24; border: 1px solid #444;
+  border-radius: 6px; padding: 4px 0; z-index: 1000;
+  min-width: 160px; box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+}
+.ctx-menu-item {
+  padding: 6px 14px; font-size: 12px; color: #ddd; cursor: pointer;
+}
+.ctx-menu-item:hover { background: #262b36; }
+.ctx-menu-divider { height: 1px; background: #333; margin: 4px 0; }
 
 .clip-main-row { display: flex; align-items: center; gap: 8px; width: 100%; }
 .clip-meta { display: flex; gap: 4px; padding-left: 18px; margin-top: 2px; flex-wrap: wrap; }
@@ -81,6 +100,23 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .badge-impact { background: #3a2a1a; color: #ffcf4b; }
 .badge-reason { background: #2a1a3a; color: #c74bff; }
 .empty-msg { font-size: 13px; color: #666; padding: 12px 0; }
+
+/* ── Highlight star toggle ───────────────────────────── */
+.clip-star {
+  background: none; border: none; cursor: pointer;
+  font-size: 16px; padding: 2px 4px; flex-shrink: 0;
+  line-height: 1;
+}
+.clip-star.highlighted { color: #ffcf4b; }
+.clip-star.not-highlighted { color: #888; }
+
+/* ── Filter toggle ───────────────────────────────────── */
+.filter-btn {
+  background: #262b36; border: 1px solid #444; color: #aaa;
+  padding: 2px 10px; border-radius: 4px; cursor: pointer;
+  font-size: 11px; font-weight: 600; margin-left: 8px;
+}
+.filter-btn.active { background: #3a3f1a; border-color: #ffcf4b; color: #ffcf4b; }
 </style>
 </head>
 <body>
@@ -138,6 +174,7 @@ function setComponentValue(value) {
 
 function setFrameHeight(height) {
   height = height || document.body.scrollHeight;
+  if (height < 400) height = 600;
   sendMessageToStreamlit("streamlit:setFrameHeight", { height: height });
 }
 
@@ -146,6 +183,38 @@ const CLIP_COLORS = [
   "#ff4b4b","#4bafff","#4bff88","#ffcf4b","#c74bff",
   "#ff4ba8","#4bfff0","#ff8c4b","#8c4bff","#4bff4b",
 ];
+
+// ── Multi-row timeline constants ─────────────────────────
+var ROW_DURATION = 600;  // 10 min per row
+var ROW_HEIGHT = 72;
+var ROW_GAP = 2;
+
+function getRowCount() {
+  if (duration <= 0) return 1;
+  return Math.max(1, Math.ceil(duration / ROW_DURATION));
+}
+
+function timeToRow(t) {
+  return Math.min(getRowCount() - 1, Math.floor(t / ROW_DURATION));
+}
+
+function timeToXInRow(t) {
+  var row = timeToRow(t);
+  var rowStart = row * ROW_DURATION;
+  var rowEnd = Math.min(duration, (row + 1) * ROW_DURATION);
+  var rowDur = rowEnd - rowStart;
+  if (rowDur <= 0) return 0;
+  return ((t - rowStart) / rowDur) * tlWrap.clientWidth;
+}
+
+function rowYOffset(row) {
+  return row * (ROW_HEIGHT + ROW_GAP);
+}
+
+function getTotalTimelineHeight() {
+  var rows = getRowCount();
+  return rows * ROW_HEIGHT + Math.max(0, rows - 1) * ROW_GAP;
+}
 
 // ── State ────────────────────────────────────────────────
 let videoUrl = "";
@@ -156,6 +225,7 @@ let markers = [];
 let activity = [];
 let cheers = [];
 let activeClipId = null;
+let filterHighlightsOnly = false;
 
 // Drag / selection
 let isDragging = false;
@@ -205,25 +275,48 @@ function clipColor(idx) {
   return CLIP_COLORS[idx % CLIP_COLORS.length];
 }
 
-function xToTime(x) {
+function xToTime(x, y) {
   var rect = fgCanvas.getBoundingClientRect();
-  return Math.max(0, Math.min(duration, (x - rect.left) / rect.width * duration));
+  var rows = getRowCount();
+  var localX = x - rect.left;
+  var localY = (y !== undefined) ? y - rect.top : 0;
+  var row = 0;
+  if (rows > 1 && y !== undefined) {
+    row = Math.floor(localY / (ROW_HEIGHT + ROW_GAP));
+    row = Math.max(0, Math.min(rows - 1, row));
+  }
+  var rowStart = row * ROW_DURATION;
+  var rowEnd = Math.min(duration, (row + 1) * ROW_DURATION);
+  var rowDur = rowEnd - rowStart;
+  var t = rowStart + (localX / rect.width) * rowDur;
+  return Math.max(0, Math.min(duration, t));
 }
 
 function timeToX(t) {
   return (t / duration) * fgCanvas.getBoundingClientRect().width;
 }
 
-// Returns "start", "end", or null — checks if clientX is near active clip's edge
-function hitActiveClipEdge(clientX) {
+// Returns "start", "end", or null — checks if (clientX, clientY) is near active clip's edge
+function hitActiveClipEdge(clientX, clientY) {
   if (activeClipId === null || duration <= 0) return null;
   var ac = clips.find(function(c) { return c.id === activeClipId; });
   if (!ac) return null;
   var rect = fgCanvas.getBoundingClientRect();
-  var startX = (ac.clip_start / duration) * rect.width + rect.left;
-  var endX = (ac.clip_end / duration) * rect.width + rect.left;
-  if (Math.abs(clientX - startX) <= 6) return "start";
-  if (Math.abs(clientX - endX) <= 6) return "end";
+  var localY = clientY - rect.top;
+  // Check which row the mouse is on
+  var mouseRow = Math.floor(localY / (ROW_HEIGHT + ROW_GAP));
+  // Check start edge
+  var startRow = timeToRow(ac.clip_start);
+  if (mouseRow === startRow) {
+    var startX = timeToXInRow(ac.clip_start) + rect.left;
+    if (Math.abs(clientX - startX) <= 6) return "start";
+  }
+  // Check end edge
+  var endRow = timeToRow(ac.clip_end);
+  if (mouseRow === endRow) {
+    var endX = timeToXInRow(ac.clip_end) + rect.left;
+    if (Math.abs(clientX - endX) <= 6) return "end";
+  }
   return null;
 }
 
@@ -286,7 +379,8 @@ function stopPlayheadLoop() {
 // ── Timeline drawing ─────────────────────────────────────
 function resizeCanvases() {
   var w = tlWrap.clientWidth;
-  var h = tlWrap.clientHeight;
+  var h = getTotalTimelineHeight();
+  tlWrap.style.height = h + "px";
   var dpr = window.devicePixelRatio || 1;
   [bgCanvas, fgCanvas].forEach(function(c) {
     c.width = w * dpr;
@@ -300,118 +394,177 @@ function resizeCanvases() {
 function drawBackground() {
   var ctx = bgCanvas.getContext("2d");
   var w = tlWrap.clientWidth;
-  var h = tlWrap.clientHeight;
-  ctx.clearRect(0, 0, w, h);
+  var totalH = getTotalTimelineHeight();
+  ctx.clearRect(0, 0, w, totalH);
 
   if (duration <= 0) return;
 
-  // Time ruler
-  var step = duration <= 60 ? 5 : duration <= 300 ? 10 : 30;
-  ctx.fillStyle = "#555";
-  ctx.font = "10px sans-serif";
-  ctx.textBaseline = "top";
-  for (var t = 0; t <= duration; t += step) {
-    var x = (t / duration) * w;
-    ctx.fillRect(x, 0, 1, 8);
-    ctx.fillText(fmtTime(t), x + 2, 1);
-  }
+  var rows = getRowCount();
 
-  // Activity curve (background)
-  if (activity.length > 0) {
-    ctx.save();
-    ctx.globalAlpha = 0.25;
-    ctx.fillStyle = "#4bafff";
-    ctx.beginPath();
-    ctx.moveTo(0, h);
-    for (var ai = 0; ai < activity.length; ai++) {
-      var ax = (activity[ai].t / duration) * w;
-      var ay = h - activity[ai].activity * (h - 12);
-      ctx.lineTo(ax, ay);
-    }
-    ctx.lineTo(w, h);
-    ctx.closePath();
-    ctx.fill();
-    ctx.restore();
-  }
+  for (var row = 0; row < rows; row++) {
+    var yOff = rowYOffset(row);
+    var rH = ROW_HEIGHT;
+    var rowStart = row * ROW_DURATION;
+    var rowEnd = Math.min(duration, (row + 1) * ROW_DURATION);
+    var rowDur = rowEnd - rowStart;
+    if (rowDur <= 0) continue;
 
-  // Cheer segments
-  if (cheers.length > 0) {
-    ctx.fillStyle = "rgba(255,165,0,0.15)";
-    for (var ci = 0; ci < cheers.length; ci++) {
-      var cx1 = (cheers[ci].start / duration) * w;
-      var cx2 = (cheers[ci].end / duration) * w;
-      ctx.fillRect(cx1, 0, cx2 - cx1, h);
-    }
-  }
-
-  // Marker ticks (audio events)
-  if (markers.length > 0) {
-    ctx.fillStyle = "rgba(255,200,0,0.5)";
-    for (var mi = 0; mi < markers.length; mi++) {
-      var mx = (markers[mi] / duration) * w;
-      ctx.fillRect(mx, h - 6, 1.5, 6);
-    }
-  }
-
-  // Clip bars
-  var barY = 18;
-  var barH = h - 28;
-  clips.forEach(function(clip, i) {
-    var x1 = (clip.clip_start / duration) * w;
-    var x2 = (clip.clip_end / duration) * w;
-    var isActive = clip.id === activeClipId;
-    ctx.fillStyle = clipColor(i) + (isActive ? "66" : "44");
-    ctx.fillRect(x1, barY, x2 - x1, barH);
-    ctx.fillStyle = clipColor(i);
-    ctx.fillRect(x1, barY, isActive ? 3 : 2, barH);
-    ctx.fillRect(x2 - (isActive ? 3 : 2), barY, isActive ? 3 : 2, barH);
-
-    // Active clip border highlight
-    if (isActive) {
-      ctx.strokeStyle = clipColor(i);
-      ctx.lineWidth = 2;
-      ctx.strokeRect(x1, barY, x2 - x1, barH);
+    // Row background separator
+    if (row > 0) {
+      ctx.fillStyle = "#0e1117";
+      ctx.fillRect(0, yOff - ROW_GAP, w, ROW_GAP);
     }
 
-    // Label
-    var labelW = x2 - x1;
-    if (labelW > 30) {
-      ctx.fillStyle = clipColor(i);
+    // Time ruler for this row
+    var step = rowDur <= 60 ? 5 : rowDur <= 300 ? 10 : 30;
+    ctx.fillStyle = "#555";
+    ctx.font = "10px sans-serif";
+    ctx.textBaseline = "top";
+    for (var t = Math.ceil(rowStart / step) * step; t <= rowEnd; t += step) {
+      var x = ((t - rowStart) / rowDur) * w;
+      ctx.fillRect(x, yOff, 1, 8);
+      ctx.fillText(fmtTime(t), x + 2, yOff + 1);
+    }
+    // Row start label
+    if (rows > 1) {
+      ctx.fillStyle = "#777";
       ctx.font = "bold 10px sans-serif";
-      ctx.textBaseline = "middle";
-      ctx.fillText(clip.label || ("#" + clip.id), x1 + 5, barY + barH / 2, labelW - 10);
+      ctx.fillText(fmtTime(rowStart), 2, yOff + 1);
     }
-  });
+
+    // Activity curve for this row
+    if (activity.length > 0) {
+      ctx.save();
+      ctx.globalAlpha = 0.25;
+      ctx.fillStyle = "#4bafff";
+      ctx.beginPath();
+      ctx.moveTo(0, yOff + rH);
+      for (var ai = 0; ai < activity.length; ai++) {
+        var at = activity[ai].t;
+        if (at < rowStart || at > rowEnd) continue;
+        var ax = ((at - rowStart) / rowDur) * w;
+        var ay = yOff + rH - activity[ai].activity * (rH - 12);
+        ctx.lineTo(ax, ay);
+      }
+      ctx.lineTo(w, yOff + rH);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // Cheer segments for this row
+    if (cheers.length > 0) {
+      ctx.fillStyle = "rgba(255,165,0,0.15)";
+      for (var ci = 0; ci < cheers.length; ci++) {
+        var cs = cheers[ci].start;
+        var ce = cheers[ci].end;
+        if (ce < rowStart || cs > rowEnd) continue;
+        var cx1 = ((Math.max(cs, rowStart) - rowStart) / rowDur) * w;
+        var cx2 = ((Math.min(ce, rowEnd) - rowStart) / rowDur) * w;
+        ctx.fillRect(cx1, yOff, cx2 - cx1, rH);
+      }
+    }
+
+    // Marker ticks for this row
+    if (markers.length > 0) {
+      ctx.fillStyle = "rgba(255,200,0,0.5)";
+      for (var mi = 0; mi < markers.length; mi++) {
+        var mt = markers[mi];
+        if (mt < rowStart || mt > rowEnd) continue;
+        var mx = ((mt - rowStart) / rowDur) * w;
+        ctx.fillRect(mx, yOff + rH - 6, 1.5, 6);
+      }
+    }
+
+    // Clip bars for this row
+    var barY = yOff + 18;
+    var barH = rH - 28;
+    clips.forEach(function(clip, i) {
+      if (clip.clip_end < rowStart || clip.clip_start > rowEnd) return;
+      var cStart = Math.max(clip.clip_start, rowStart);
+      var cEnd = Math.min(clip.clip_end, rowEnd);
+      var x1 = ((cStart - rowStart) / rowDur) * w;
+      var x2 = ((cEnd - rowStart) / rowDur) * w;
+      var isActive = clip.id === activeClipId;
+      var isHL = clip.is_highlight === true;
+
+      if (isHL) {
+        ctx.fillStyle = clipColor(i) + (isActive ? "66" : "44");
+      } else {
+        ctx.fillStyle = isActive ? "rgba(85,85,85,0.4)" : "rgba(85,85,85,0.25)";
+      }
+      ctx.fillRect(x1, barY, x2 - x1, barH);
+
+      var edgeColor = isHL ? clipColor(i) : "#666";
+      ctx.fillStyle = edgeColor;
+      // Only draw start/end edges if they're actually in this row
+      if (clip.clip_start >= rowStart && clip.clip_start <= rowEnd) {
+        ctx.fillRect(x1, barY, isActive ? 3 : 2, barH);
+      }
+      if (clip.clip_end >= rowStart && clip.clip_end <= rowEnd) {
+        ctx.fillRect(x2 - (isActive ? 3 : 2), barY, isActive ? 3 : 2, barH);
+      }
+
+      if (isActive) {
+        ctx.strokeStyle = edgeColor;
+        ctx.lineWidth = 2;
+        ctx.strokeRect(x1, barY, x2 - x1, barH);
+      }
+
+      // Label + star
+      var labelW = x2 - x1;
+      if (labelW > 30) {
+        ctx.fillStyle = isHL ? clipColor(i) : "#888";
+        ctx.font = "bold 10px sans-serif";
+        ctx.textBaseline = "middle";
+        var prefix = isHL ? "\u2605 " : "";
+        ctx.fillText(prefix + (clip.label || ("#" + clip.id)), x1 + 5, barY + barH / 2, labelW - 10);
+      }
+    });
+  }
 }
 
 function drawForeground() {
   var ctx = fgCanvas.getContext("2d");
   var w = tlWrap.clientWidth;
-  var h = tlWrap.clientHeight;
-  ctx.clearRect(0, 0, w, h);
+  var totalH = getTotalTimelineHeight();
+  ctx.clearRect(0, 0, w, totalH);
 
   if (duration <= 0) return;
 
-  // Ghost selection
+  var rows = getRowCount();
+
+  // Ghost selection — draw across affected rows
   if (selStart >= 0 && selEnd >= 0 && selStart !== selEnd) {
-    var sx1 = (Math.min(selStart, selEnd) / duration) * w;
-    var sx2 = (Math.max(selStart, selEnd) / duration) * w;
-    ctx.fillStyle = "rgba(255,75,75,0.18)";
-    ctx.fillRect(sx1, 0, sx2 - sx1, h);
-    ctx.strokeStyle = "#ff4b4b";
-    ctx.lineWidth = 1;
-    ctx.strokeRect(sx1, 0, sx2 - sx1, h);
+    var sMin = Math.min(selStart, selEnd);
+    var sMax = Math.max(selStart, selEnd);
+    for (var sr = 0; sr < rows; sr++) {
+      var srStart = sr * ROW_DURATION;
+      var srEnd = Math.min(duration, (sr + 1) * ROW_DURATION);
+      var srDur = srEnd - srStart;
+      if (sMax < srStart || sMin > srEnd) continue;
+      var yOff = rowYOffset(sr);
+      var sx1 = ((Math.max(sMin, srStart) - srStart) / srDur) * w;
+      var sx2 = ((Math.min(sMax, srEnd) - srStart) / srDur) * w;
+      ctx.fillStyle = "rgba(255,75,75,0.18)";
+      ctx.fillRect(sx1, yOff, sx2 - sx1, ROW_HEIGHT);
+      ctx.strokeStyle = "#ff4b4b";
+      ctx.lineWidth = 1;
+      ctx.strokeRect(sx1, yOff, sx2 - sx1, ROW_HEIGHT);
+    }
   }
 
-  // Playhead
-  var px = (video.currentTime / duration) * w;
+  // Playhead — draw on the correct row
+  var pRow = timeToRow(video.currentTime);
+  var pYOff = rowYOffset(pRow);
+  var px = timeToXInRow(video.currentTime);
   ctx.fillStyle = "#ff4b4b";
-  ctx.fillRect(px - 1, 0, 2, h);
+  ctx.fillRect(px - 1, pYOff, 2, ROW_HEIGHT);
   // Triangle head
   ctx.beginPath();
-  ctx.moveTo(px - 5, 0);
-  ctx.lineTo(px + 5, 0);
-  ctx.lineTo(px, 7);
+  ctx.moveTo(px - 5, pYOff);
+  ctx.lineTo(px + 5, pYOff);
+  ctx.lineTo(px, pYOff + 7);
   ctx.closePath();
   ctx.fill();
 }
@@ -419,7 +572,7 @@ function drawForeground() {
 // ── Timeline mouse events ────────────────────────────────
 fgCanvas.addEventListener("mousedown", function(e) {
   // Check if we're on an active clip's edge for resize
-  var edge = hitActiveClipEdge(e.clientX);
+  var edge = hitActiveClipEdge(e.clientX, e.clientY);
   if (edge) {
     isResizing = edge;
     resizingClipId = activeClipId;
@@ -428,7 +581,7 @@ fgCanvas.addEventListener("mousedown", function(e) {
 
   isDragging = true;
   dragStartX = e.clientX;
-  selStart = xToTime(e.clientX);
+  selStart = xToTime(e.clientX, e.clientY);
   selEnd = selStart;
   drawForeground();
 });
@@ -436,7 +589,7 @@ fgCanvas.addEventListener("mousedown", function(e) {
 fgCanvas.addEventListener("mousemove", function(e) {
   // Resize mode: update clip boundary in real-time
   if (isResizing && resizingClipId !== null) {
-    var t = xToTime(e.clientX);
+    var t = xToTime(e.clientX, e.clientY);
     var ac = clips.find(function(c) { return c.id === resizingClipId; });
     if (ac) {
       if (isResizing === "start" && t < ac.clip_end) {
@@ -453,11 +606,11 @@ fgCanvas.addEventListener("mousemove", function(e) {
   }
 
   // Update cursor based on edge proximity
-  var edge = hitActiveClipEdge(e.clientX);
+  var edge = hitActiveClipEdge(e.clientX, e.clientY);
   fgCanvas.style.cursor = edge ? "col-resize" : "crosshair";
 
   if (!isDragging) return;
-  selEnd = xToTime(e.clientX);
+  selEnd = xToTime(e.clientX, e.clientY);
   drawForeground();
 });
 
@@ -481,7 +634,7 @@ window.addEventListener("mouseup", function(e) {
 
   if (!isDragging) return;
   isDragging = false;
-  selEnd = xToTime(e.clientX);
+  selEnd = xToTime(e.clientX, e.clientY);
 
   var dist = Math.abs(e.clientX - dragStartX);
   if (dist < 5) {
@@ -532,9 +685,21 @@ btnAddClip.addEventListener("click", function() {
 // ── Clip list rendering ──────────────────────────────────
 function renderClipList() {
   clipHeader.innerHTML = "";
+
+  var hlCount = clips.filter(function(c) { return c.is_highlight === true; }).length;
   var headerText = document.createElement("span");
-  headerText.textContent = "Clips (" + clips.length + ")";
+  headerText.textContent = "Rallies (" + clips.length + ") \u2014 " + hlCount + " highlighted";
   clipHeader.appendChild(headerText);
+
+  // Filter toggle button
+  var filterBtn = document.createElement("button");
+  filterBtn.className = "filter-btn" + (filterHighlightsOnly ? " active" : "");
+  filterBtn.textContent = filterHighlightsOnly ? "\u2605 Highlights" : "All";
+  filterBtn.addEventListener("click", function() {
+    filterHighlightsOnly = !filterHighlightsOnly;
+    renderClipList();
+  });
+  clipHeader.appendChild(filterBtn);
 
   if (clips.length > 0) {
     var clearBtn = document.createElement("button");
@@ -555,17 +720,46 @@ function renderClipList() {
 
   var sorted = clips.slice().sort(function(a, b) { return a.clip_start - b.clip_start; });
 
-  sorted.forEach(function(clip, i) {
+  // Apply filter
+  var filtered = filterHighlightsOnly
+    ? sorted.filter(function(c) { return c.is_highlight === true; })
+    : sorted;
+
+  if (filtered.length === 0) {
+    clipItems.innerHTML = '<div class="empty-msg">No highlighted clips. Click \u2606 to mark highlights.</div>';
+    return;
+  }
+
+  filtered.forEach(function(clip, i) {
     var div = document.createElement("div");
     div.className = "clip-item" + (clip.id === activeClipId ? " active" : "");
 
+    var isHL = clip.is_highlight === true;
+
+    // Star toggle button
+    var starBtn = document.createElement("button");
+    starBtn.className = "clip-star " + (isHL ? "highlighted" : "not-highlighted");
+    starBtn.textContent = isHL ? "\u2605" : "\u2606";
+    starBtn.addEventListener("click", (function(c) {
+      return function(e) {
+        e.stopPropagation();
+        setComponentValue({
+          action: "toggle_highlight",
+          clip_id: c.id,
+          is_highlight: c.is_highlight !== true,
+          _ts: Date.now()
+        });
+      };
+    })(clip));
+
     var dot = document.createElement("span");
     dot.className = "clip-color";
-    dot.style.background = clipColor(i);
+    dot.style.background = isHL ? clipColor(i) : "#555";
 
     var label = document.createElement("span");
     label.className = "clip-label";
     label.textContent = clip.label || ("Clip #" + clip.id);
+    if (!isHL) label.style.color = "#888";
 
     var time = document.createElement("span");
     time.className = "clip-time";
@@ -583,11 +777,19 @@ function renderClipList() {
 
     var mainRow = document.createElement("div");
     mainRow.className = "clip-main-row";
+    mainRow.appendChild(starBtn);
     mainRow.appendChild(dot);
     mainRow.appendChild(label);
     mainRow.appendChild(time);
     mainRow.appendChild(delBtn);
     div.appendChild(mainRow);
+
+    // Right-click context menu
+    div.addEventListener("contextmenu", (function(c) {
+      return function(e) {
+        showContextMenu(e, c);
+      };
+    })(clip));
 
     // Metadata badges (auto-detected clips only)
     if (clip.conf_audio !== undefined) {
@@ -648,14 +850,28 @@ function renderClipOverlays() {
   container.innerHTML = "";
   if (duration <= 0) return;
   var w = tlWrap.clientWidth;
+  var rows = getRowCount();
+
   clips.forEach(function(clip, i) {
-    var x1 = (clip.clip_start / duration) * w;
-    var x2 = (clip.clip_end / duration) * w;
+    // Find the primary row for this clip (where it starts)
+    var clipRow = timeToRow(clip.clip_start);
+    var rowStart = clipRow * ROW_DURATION;
+    var rowEnd = Math.min(duration, (clipRow + 1) * ROW_DURATION);
+    var rowDur = rowEnd - rowStart;
+    if (rowDur <= 0) return;
+    var yOff = rowYOffset(clipRow);
+
+    var cStart = Math.max(clip.clip_start, rowStart);
+    var cEnd = Math.min(clip.clip_end, rowEnd);
+    var x1 = ((cStart - rowStart) / rowDur) * w;
+    var x2 = ((cEnd - rowStart) / rowDur) * w;
     var midX = (x1 + x2) / 2;
+
+    // Label button
     var btn = document.createElement("button");
     btn.textContent = clip.label || ("#" + clip.id);
     btn.style.cssText = "position:absolute; pointer-events:auto; " +
-      "left:" + midX + "px; top:2px; transform:translateX(-50%); " +
+      "left:" + midX + "px; top:" + (yOff + 2) + "px; transform:translateX(-50%); " +
       "background:" + clipColor(i) + "; color:#fff; border:none; " +
       "border-radius:8px; padding:1px 6px; font-size:9px; cursor:pointer; " +
       "opacity:" + (clip.id === activeClipId ? "1" : "0.7") + "; z-index:10;";
@@ -676,8 +892,106 @@ function renderClipOverlays() {
       };
     })(clip));
     container.appendChild(btn);
+
+    // Star toggle button on timeline (Fix #5)
+    if (x2 - x1 > 20) {
+      var isHL = clip.is_highlight === true;
+      var starBtn = document.createElement("button");
+      starBtn.textContent = isHL ? "\u2605" : "\u2606";
+      starBtn.style.cssText = "position:absolute; pointer-events:auto; " +
+        "left:" + midX + "px; top:" + (yOff + ROW_HEIGHT - 14) + "px; " +
+        "transform:translateX(-50%); background:none; border:none; " +
+        "cursor:pointer; font-size:14px; line-height:1; padding:0; " +
+        "color:" + (isHL ? "#ffcf4b" : "#666") + "; z-index:10;";
+      starBtn.addEventListener("click", (function(c) {
+        return function(e) {
+          e.stopPropagation();
+          setComponentValue({
+            action: "toggle_highlight",
+            clip_id: c.id,
+            is_highlight: c.is_highlight !== true,
+            _ts: Date.now()
+          });
+        };
+      })(clip));
+      container.appendChild(starBtn);
+    }
   });
 }
+
+// ── Context Menu ──────────────────────────────────────────
+var ctxMenu = null;
+
+function addMenuItem(menu, label, onClick) {
+  var item = document.createElement("div");
+  item.className = "ctx-menu-item";
+  item.textContent = label;
+  item.addEventListener("click", function(e) {
+    e.stopPropagation();
+    hideContextMenu();
+    onClick();
+  });
+  menu.appendChild(item);
+}
+
+function addDivider(menu) {
+  var d = document.createElement("div");
+  d.className = "ctx-menu-divider";
+  menu.appendChild(d);
+}
+
+function showContextMenu(e, clip) {
+  e.preventDefault();
+  e.stopPropagation();
+  hideContextMenu();
+  ctxMenu = document.createElement("div");
+  ctxMenu.className = "ctx-menu";
+  ctxMenu.style.left = e.clientX + "px";
+  ctxMenu.style.top = e.clientY + "px";
+
+  // Diagnosis menu — label depends on clip type
+  var hasRallyId = clip.rally_id !== undefined && clip.rally_id !== null;
+  var diagLabel = hasRallyId ? "Why detected?" : "Why missed?";
+  addMenuItem(ctxMenu, diagLabel, function() {
+    setComponentValue({
+      action: "diagnose_clip", clip_id: clip.id,
+      clip_start: clip.clip_start, clip_end: clip.clip_end,
+      is_auto: hasRallyId, label: clip.label, _ts: Date.now()
+    });
+  });
+
+  addDivider(ctxMenu);
+  addMenuItem(ctxMenu, "Export Video", function() {
+    setComponentValue({
+      action: "export_clip_video", clip_id: clip.id,
+      clip_start: clip.clip_start, clip_end: clip.clip_end,
+      label: clip.label, _ts: Date.now()
+    });
+  });
+  addMenuItem(ctxMenu, "Export GIF", function() {
+    setComponentValue({
+      action: "export_clip_gif", clip_id: clip.id,
+      clip_start: clip.clip_start, clip_end: clip.clip_end,
+      label: clip.label, _ts: Date.now()
+    });
+  });
+
+  document.body.appendChild(ctxMenu);
+
+  // Clamp position to viewport
+  var rect = ctxMenu.getBoundingClientRect();
+  if (rect.right > window.innerWidth) {
+    ctxMenu.style.left = (window.innerWidth - rect.width - 4) + "px";
+  }
+  if (rect.bottom > window.innerHeight) {
+    ctxMenu.style.top = (window.innerHeight - rect.height - 4) + "px";
+  }
+}
+
+function hideContextMenu() {
+  if (ctxMenu) { ctxMenu.remove(); ctxMenu = null; }
+}
+document.addEventListener("click", hideContextMenu);
 
 // ── Receive render events from Streamlit ─────────────────
 function onRender(event) {

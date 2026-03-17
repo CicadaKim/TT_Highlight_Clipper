@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import load_default_config
+from .recent import add_recent_job
 
 import yaml
 
@@ -44,6 +45,8 @@ def create_job(input_video: str, out_base_dir: str) -> Path:
     config_path = out_dir / "config.yaml"
     with open(config_path, "w", encoding="utf-8") as f:
         yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+
+    add_recent_job(str(job_path), job_data)
 
     return job_path
 

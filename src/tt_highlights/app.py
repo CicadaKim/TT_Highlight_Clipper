@@ -14,6 +14,8 @@ from tt_highlights.job import create_job, load_job, artifacts_dir, exports_dir, 
 from tt_highlights.config import load_config
 from tt_highlights.steps import get_step_function
 from tt_highlights.media_server import start_media_server, get_media_url
+from tt_highlights.recent import add_recent_job, get_recent_jobs, remove_recent_job
+from tt_highlights.diagnose import diagnose_missed_rally, explain_detected_rally
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +111,7 @@ def _sidebar():
 def _screen_setup():
     st.header("1. Setup")
 
-    tab_new, tab_load = st.tabs(["New Job", "Load Existing"])
+    tab_new, tab_load, tab_recent = st.tabs(["New Job", "Load Existing", "Recent Jobs"])
 
     with tab_new:
         # Apply browse result before widget renders
@@ -157,6 +159,7 @@ def _screen_setup():
             except Exception as e:
                 st.error(f"Error: {e}")
 
+
     with tab_load:
         # Apply browse result before widget renders
         if "_picked_job" in st.session_state:
@@ -181,11 +184,47 @@ def _screen_setup():
             if existing_job and Path(existing_job).exists():
                 st.session_state.job_path = existing_job
                 st.session_state.clips = _load_clips(existing_job)
+                job_data = load_job(existing_job)
+                add_recent_job(existing_job, job_data)
                 st.success("Job loaded.")
-                st.session_state.current_screen = "setup"
+                # Auto-navigate to editor if preprocess is done
+                art = artifacts_dir(existing_job)
+                if (art / "video_meta.json").exists():
+                    st.session_state.current_screen = "editor"
+                else:
+                    st.session_state.current_screen = "setup"
                 st.rerun()
             else:
                 st.error("job.json not found.")
+
+    with tab_recent:
+        recent = get_recent_jobs()
+        if not recent:
+            st.info("No recent jobs.")
+        else:
+            for idx, rj in enumerate(recent):
+                col1, col2, col3 = st.columns([4, 1, 1])
+                with col1:
+                    st.markdown(f"**{rj['video_name']}**")
+                    opened = rj.get("last_opened", "")[:10]
+                    st.caption(f"Last opened: {opened} | {rj['job_path']}")
+                with col2:
+                    if st.button("Open", key=f"recent_open_{idx}"):
+                        jp = rj["job_path"]
+                        st.session_state.job_path = jp
+                        st.session_state.clips = _load_clips(jp)
+                        job_data = load_job(jp)
+                        add_recent_job(jp, job_data)
+                        art = artifacts_dir(jp)
+                        if (art / "video_meta.json").exists():
+                            st.session_state.current_screen = "editor"
+                        else:
+                            st.session_state.current_screen = "setup"
+                        st.rerun()
+                with col3:
+                    if st.button("Remove", key=f"recent_rm_{idx}"):
+                        remove_recent_job(rj["job_path"])
+                        st.rerun()
 
     # Preview if job is loaded
     if not st.session_state.job_path:
@@ -243,6 +282,8 @@ def _screen_clip_editor():
     if proxy_path.exists():
         port = start_media_server(str(art))
         video_url = get_media_url(port, "proxy.mp4")
+    else:
+        st.warning(f"proxy.mp4 not found: {proxy_path}")
 
     # ── Collect markers from audio events ─────────────────────────────────
     markers = []
@@ -427,17 +468,30 @@ def _screen_clip_editor():
                     rallies_data = json.load(f)
                 rallies = rallies_data.get("rallies", [])
                 if rallies:
+                    hl_cfg = _load_job_config().get("highlights", {})
+                    hl_threshold = hl_cfg.get("auto_threshold", 0.4)
                     next_id = _next_clip_id()
                     for r in rallies:
                         end = r.get("end_refined", r["end"])
+                        ca = r.get("conf_audio", 0)
+                        cv_norm = r.get("conf_video_norm", 0)
+                        rhythm = r.get("rhythm_score", 0)
+                        cv_raw = r.get("conf_video", 0)
+                        vid_floor = hl_cfg.get("video_floor", 0.03)
+                        if cv_raw < vid_floor:
+                            combined = 0.0
+                        else:
+                            combined = ca * 0.3 + cv_norm * 0.5 + rhythm * 0.2
                         st.session_state.clips.append({
                             "id": next_id,
                             "rally_id": r["id"],
                             "clip_start": r["start"],
                             "clip_end": end,
                             "label": f"Rally {r['id']}",
+                            "is_highlight": combined >= hl_threshold,
                             "conf_audio": r.get("conf_audio", 0),
                             "conf_video": r.get("conf_video", 0),
+                            "conf_video_norm": cv_norm,
                             "impact_count": r.get("impact_count", 0),
                             "rhythm_score": r.get("rhythm_score", 0),
                             "reason_end": r.get("reason_end_refined", ""),
@@ -516,6 +570,7 @@ def _screen_clip_editor():
                     "clip_start": clip_data.get("start", 0.0),
                     "clip_end": clip_data.get("end", 0.0),
                     "label": clip_data.get("label") or f"Clip {next_id}",
+                    "is_highlight": False,
                 })
                 _save_clips(st.session_state.job_path, st.session_state.clips)
                 st.rerun()
@@ -540,36 +595,209 @@ def _screen_clip_editor():
                 _save_clips(st.session_state.job_path, st.session_state.clips)
                 st.rerun()
 
+            elif action == "toggle_highlight":
+                clip_id = component_value.get("clip_id")
+                is_highlight = component_value.get("is_highlight", False)
+                for c in st.session_state.clips:
+                    if c["id"] == clip_id:
+                        c["is_highlight"] = is_highlight
+                        break
+                _save_clips(st.session_state.job_path, st.session_state.clips)
+                st.rerun()
+
             elif action == "clear_all_clips":
                 st.session_state.clips = []
                 _save_clips(st.session_state.job_path, st.session_state.clips)
                 st.rerun()
 
-    # ── Quick Export from editor ──────────────────────────────────────────
+            elif action in ("export_clip_video", "export_clip_gif"):
+                clip_start = component_value.get("clip_start")
+                clip_end = component_value.get("clip_end")
+                clip_label = component_value.get("label", "clip")
+                fmt = "video" if action == "export_clip_video" else "gif"
+                try:
+                    path = _export_single_clip(
+                        clip_start, clip_end, clip_label, fmt,
+                    )
+                    st.session_state._single_export_result = f"Exported: {path.name}"
+                except Exception as e:
+                    st.session_state._single_export_result = f"Export failed: {e}"
+                st.rerun()
+
+            elif action == "diagnose_clip":
+                clip_id = component_value.get("clip_id")
+                clip_start = component_value.get("clip_start")
+                clip_end = component_value.get("clip_end")
+                is_auto = component_value.get("is_auto", False)
+
+                audio_ev_path = art / "audio_events.json"
+                act_path = art / "activity.json"
+                if not audio_ev_path.exists() or not act_path.exists():
+                    st.session_state._diagnosis = {
+                        "clip_id": clip_id, "error": "Run auto-detect first",
+                    }
+                else:
+                    try:
+                        diag_cfg = _load_job_config()
+                        # Apply current slider overrides
+                        from tt_highlights.config import _deep_merge
+                        diag_cfg = _deep_merge(diag_cfg, config_override)
+                        if is_auto:
+                            clip_data = next(
+                                (c for c in st.session_state.clips if c["id"] == clip_id),
+                                None,
+                            )
+                            if clip_data:
+                                result = explain_detected_rally(
+                                    clip_data, audio_ev_path, act_path, diag_cfg,
+                                )
+                                st.session_state._diagnosis = {
+                                    "clip_id": clip_id, "is_auto": True,
+                                    "result": result, "label": component_value.get("label"),
+                                }
+                            else:
+                                st.session_state._diagnosis = {
+                                    "clip_id": clip_id, "error": "Clip not found",
+                                }
+                        else:
+                            result = diagnose_missed_rally(
+                                clip_start, clip_end,
+                                audio_ev_path, act_path, diag_cfg,
+                            )
+                            st.session_state._diagnosis = {
+                                "clip_id": clip_id, "is_auto": False,
+                                "result": result, "label": component_value.get("label"),
+                            }
+                    except Exception as e:
+                        st.session_state._diagnosis = {
+                            "clip_id": clip_id, "error": str(e),
+                        }
+                st.rerun()
+
+    # Show single export result
+    if "_single_export_result" in st.session_state:
+        msg = st.session_state.pop("_single_export_result")
+        if msg.startswith("Exported"):
+            st.success(msg)
+        else:
+            st.error(msg)
+
+    # Show diagnosis result
+    if "_diagnosis" in st.session_state:
+        diag = st.session_state._diagnosis
+        diag_label = diag.get("label", f"Clip {diag['clip_id']}")
+        with st.expander(f"Clip Diagnosis: {diag_label}", expanded=True):
+            if "error" in diag:
+                st.warning(diag["error"])
+            elif diag.get("is_auto"):
+                _render_explanation(diag["result"])
+            else:
+                _render_missed_diagnosis(diag["result"])
+            if st.button("Close Diagnosis", key="close_diag"):
+                del st.session_state._diagnosis
+                st.rerun()
+
+    # ── Batch highlight controls ──────────────────────────────────────────
     if st.session_state.clips:
         st.divider()
+
+        highlight_count = sum(1 for c in st.session_state.clips if c.get("is_highlight", False))
+        total = len(st.session_state.clips)
+
+        col_b1, col_b2 = st.columns(2)
+        with col_b1:
+            if st.button("Highlight All"):
+                for c in st.session_state.clips:
+                    c["is_highlight"] = True
+                _save_clips(st.session_state.job_path, st.session_state.clips)
+                st.rerun()
+        with col_b2:
+            if st.button("Clear Highlights"):
+                for c in st.session_state.clips:
+                    c["is_highlight"] = False
+                _save_clips(st.session_state.job_path, st.session_state.clips)
+                st.rerun()
+        st.caption(f"{highlight_count} / {total} rallies highlighted")
+
+    # ── Quick Export from editor ──────────────────────────────────────────
+    if st.session_state.clips:
         exp = exports_dir(st.session_state.job_path)
 
-        if st.button("Export All Clips", type="primary"):
-            highlights_data = _to_highlights(display_clips)
-            with open(art / "highlights.json", "w", encoding="utf-8") as f:
-                json.dump(highlights_data, f, indent=2)
-            try:
-                _run_step("export")
-                st.success("Export complete!")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Export failed: {e}")
+        highlighted_clips = [c for c in display_clips if c.get("is_highlight", False)]
+
+        col_e1, col_e2 = st.columns(2)
+        with col_e1:
+            if st.button(
+                f"Export Highlights ({len(highlighted_clips)})",
+                type="primary",
+                disabled=len(highlighted_clips) == 0,
+            ):
+                highlights_data = _to_highlights(highlighted_clips)
+                with open(art / "highlights.json", "w", encoding="utf-8") as f:
+                    json.dump(highlights_data, f, indent=2)
+                try:
+                    _run_step("export")
+                    st.success("Export complete!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Export failed: {e}")
+        with col_e2:
+            if st.button(f"Export All Rallies ({len(display_clips)})"):
+                highlights_data = _to_highlights(display_clips)
+                with open(art / "highlights.json", "w", encoding="utf-8") as f:
+                    json.dump(highlights_data, f, indent=2)
+                try:
+                    _run_step("export")
+                    st.success("Export complete!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Export failed: {e}")
+
+        col_v, col_g = st.columns(2)
+        with col_v:
+            if st.button(
+                f"Export Video Only ({len(highlighted_clips)})",
+                disabled=len(highlighted_clips) == 0,
+            ):
+                highlights_data = _to_highlights(highlighted_clips)
+                with open(art / "highlights.json", "w", encoding="utf-8") as f:
+                    json.dump(highlights_data, f, indent=2)
+                try:
+                    _run_step("export", {"export": {"export_format": "video"}})
+                    st.success("Video export complete!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Export failed: {e}")
+        with col_g:
+            if st.button(
+                f"Export GIF Only ({len(highlighted_clips)})",
+                disabled=len(highlighted_clips) == 0,
+            ):
+                highlights_data = _to_highlights(highlighted_clips)
+                with open(art / "highlights.json", "w", encoding="utf-8") as f:
+                    json.dump(highlights_data, f, indent=2)
+                try:
+                    _run_step("export", {"export": {"export_format": "gif"}})
+                    st.success("GIF export complete!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Export failed: {e}")
 
         # Show exported clips inline
         clips_dir = exp / "clips"
         if clips_dir.exists():
-            exported = sorted(clips_dir.glob("*.mp4"))
-            if exported:
-                with st.expander(f"Exported Clips ({len(exported)})", expanded=False):
-                    for ep in exported:
+            exported_mp4 = sorted(clips_dir.glob("*.mp4"))
+            exported_gif = sorted(clips_dir.glob("*.gif"))
+            if exported_mp4 or exported_gif:
+                with st.expander(f"Exported Clips ({len(exported_mp4)} MP4, {len(exported_gif)} GIF)", expanded=False):
+                    for ep in exported_mp4:
                         st.caption(ep.name)
                         st.video(str(ep))
+                    if exported_gif:
+                        st.subheader("GIFs")
+                        for gp in exported_gif:
+                            st.caption(gp.name)
+                            st.image(str(gp))
 
 
 # ─── Screen 3: Export ─────────────────────────────────────────────────────────
@@ -590,13 +818,24 @@ def _screen_export():
 
     st.subheader("Clip Summary")
 
+    # Export mode: Highlights Only vs All Rallies
+    export_mode = st.radio(
+        "Export mode", ["Highlights Only", "All Rallies"],
+        horizontal=True, key="export_mode",
+    )
+    if export_mode == "Highlights Only":
+        clips = [c for c in clips if c.get("is_highlight", False)]
+        if not clips:
+            st.info("No highlighted clips. Toggle highlights in Clip Editor.")
+
     # Select all / deselect all toggle
     all_selected = st.checkbox("Select All", value=True, key="export_select_all")
 
     selected_clips = []
     for c in clips:
         dur = c["clip_end"] - c["clip_start"]
-        label = f"{c['label']} — {c['clip_start']:.1f}s ~ {c['clip_end']:.1f}s ({dur:.1f}s)"
+        star = " ★" if c.get("is_highlight", False) else ""
+        label = f"{c['label']}{star} — {c['clip_start']:.1f}s ~ {c['clip_end']:.1f}s ({dur:.1f}s)"
         checked = st.checkbox(label, value=all_selected, key=f"export_clip_{c['id']}")
         if checked:
             selected_clips.append(c)
@@ -607,40 +846,150 @@ def _screen_export():
         st.warning("Export할 클립을 선택하세요.")
         return
 
-    if st.button("Export Selected", type="primary"):
-        # Convert selected clips -> highlights.json
-        highlights_data = _to_highlights(selected_clips)
-        with open(art / "highlights.json", "w", encoding="utf-8") as f:
-            json.dump(highlights_data, f, indent=2)
-
-        try:
-            _run_step("export")
-            st.success("Export complete!")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Export failed: {e}")
+    col_all, col_vid, col_gif = st.columns(3)
+    with col_all:
+        if st.button("Export Selected", type="primary"):
+            highlights_data = _to_highlights(selected_clips)
+            with open(art / "highlights.json", "w", encoding="utf-8") as f:
+                json.dump(highlights_data, f, indent=2)
+            try:
+                _run_step("export")
+                st.success("Export complete!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Export failed: {e}")
+    with col_vid:
+        if st.button("Export Video Only"):
+            highlights_data = _to_highlights(selected_clips)
+            with open(art / "highlights.json", "w", encoding="utf-8") as f:
+                json.dump(highlights_data, f, indent=2)
+            try:
+                _run_step("export", {"export": {"export_format": "video"}})
+                st.success("Video export complete!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Export failed: {e}")
+    with col_gif:
+        if st.button("Export GIF Only"):
+            highlights_data = _to_highlights(selected_clips)
+            with open(art / "highlights.json", "w", encoding="utf-8") as f:
+                json.dump(highlights_data, f, indent=2)
+            try:
+                _run_step("export", {"export": {"export_format": "gif"}})
+                st.success("GIF export complete!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Export failed: {e}")
 
     # Show exported clips
     clips_dir = exp / "clips"
     if clips_dir.exists():
-        exported = sorted(clips_dir.glob("*.mp4"))
-        if exported:
-            st.subheader(f"Exported Clips ({len(exported)})")
+        exported_mp4 = sorted(clips_dir.glob("*.mp4"))
+        exported_gif = sorted(clips_dir.glob("*.gif"))
+        if exported_mp4:
+            st.subheader(f"Exported Clips ({len(exported_mp4)} MP4, {len(exported_gif)} GIF)")
             cols_per_row = 3
-            for row_start in range(0, len(exported), cols_per_row):
+            for row_start in range(0, len(exported_mp4), cols_per_row):
                 cols = st.columns(cols_per_row)
                 for j, col in enumerate(cols):
                     idx = row_start + j
-                    if idx >= len(exported):
+                    if idx >= len(exported_mp4):
                         break
                     with col:
-                        st.caption(exported[idx].name)
-                        st.video(str(exported[idx]))
+                        st.caption(exported_mp4[idx].name)
+                        st.video(str(exported_mp4[idx]))
+                        # Show corresponding GIF if exists
+                        gif_path = clips_dir / (exported_mp4[idx].stem + ".gif")
+                        if gif_path.exists():
+                            st.image(str(gif_path), caption="GIF")
 
     reel_path = exp / "highlights_reel.mp4"
     if reel_path.exists():
         st.subheader("Highlights Reel")
         st.video(str(reel_path))
+
+
+# ─── Diagnosis Rendering ─────────────────────────────────────────────────────
+
+_PARAM_KEY_MAP = {
+    "impact_threshold": "p_impact_threshold",
+    "impact_gap_max_sec": "p_gap_max",
+    "min_impacts": "p_min_impacts",
+    "min_rally_duration_sec": "p_min_duration",
+    "activity_min_mean": "p_activity_min",
+    "impact_score_floor": "p_impact_threshold",
+}
+
+
+def _render_missed_diagnosis(result) -> None:
+    """Render diagnosis for a manually-created clip that was NOT auto-detected."""
+    if result.all_passed:
+        st.success("All filters passed — this rally should have been detected.")
+        return
+
+    blocked_str = ", ".join(result.blocked_by)
+    st.error(f"Blocked by: {blocked_str}")
+
+    cols = st.columns([2, 1, 1, 2])
+    cols[0].markdown("**Filter**")
+    cols[1].markdown("**Actual**")
+    cols[2].markdown("**Threshold**")
+    cols[3].markdown("**Suggestion**")
+
+    for f in result.filters:
+        cols = st.columns([2, 1, 1, 2])
+        icon = "+" if f.passed else "-"
+        cols[0].markdown(f"`{icon}` {f.name}")
+        cols[1].text(str(f.actual))
+        cols[2].text(str(f.threshold))
+        if f.suggestion is not None and not f.passed:
+            cols[3].text(f"{f.param_key} → {f.suggestion}")
+        else:
+            cols[3].text("—")
+
+    if result.suggestions:
+        st.divider()
+        if st.button("Apply Suggested Parameters", key="apply_diag_params"):
+            for param_key, value in result.suggestions.items():
+                widget_key = _PARAM_KEY_MAP.get(param_key)
+                if widget_key:
+                    st.session_state[widget_key] = value
+            del st.session_state._diagnosis
+            st.rerun()
+
+
+def _render_explanation(result) -> None:
+    """Render explanation for an auto-detected clip."""
+    st.markdown("**Detection reasons:**")
+    for r in result.detection_reasons:
+        st.markdown(f"- {r}")
+
+    st.divider()
+    st.markdown("**Highlight score breakdown:**")
+
+    bd = result.score_breakdown
+    formula = (
+        f"`{result.combined_score:.2f}` = "
+        f"audio({bd['conf_audio']:.2f} x 0.3) + "
+        f"video({bd['conf_video_norm']:.2f} x 0.5) + "
+        f"rhythm({bd['rhythm_score']:.2f} x 0.2)"
+    )
+    st.markdown(formula)
+
+    if result.is_highlight:
+        st.success(
+            f"Highlighted: {result.combined_score:.2f} >= {result.threshold}"
+        )
+    else:
+        st.info(
+            f"Not highlighted: {result.combined_score:.2f} < {result.threshold}"
+        )
+
+    if result.suggestions:
+        st.divider()
+        st.markdown("**Suggestions:**")
+        for s in result.suggestions:
+            st.markdown(f"- {s}")
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -656,6 +1005,53 @@ def _load_job_config() -> dict:
     jp = Path(st.session_state.job_path)
     config_path = jp.parent / "config.yaml"
     return load_config(str(config_path))
+
+
+def _export_single_clip(
+    clip_start: float, clip_end: float, label: str, fmt: str,
+) -> Path:
+    """Export a single clip as MP4 or GIF without touching other exports."""
+    job = load_job(st.session_state.job_path)
+    input_video = job["input_video"]
+    exp = exports_dir(st.session_state.job_path)
+    clips_dir = exp / "clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_label = label.replace(" ", "_").replace("/", "_")
+    duration = clip_end - clip_start
+
+    if fmt == "video":
+        out_path = clips_dir / f"{safe_label}.mp4"
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(clip_start), "-i", input_video, "-t", str(duration),
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-pix_fmt", "yuv420p",
+            "-profile:v", "high", "-level", "4.1",
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart",
+            str(out_path),
+        ]
+    else:
+        config = _load_job_config()
+        export_cfg = config.get("export", {})
+        gif_width = export_cfg.get("gif_width", 640)
+        gif_fps = export_cfg.get("gif_fps", 20)
+        out_path = clips_dir / f"{safe_label}.gif"
+        vf = (f"fps={gif_fps},scale={gif_width}:-1:flags=lanczos,"
+              f"split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse")
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(clip_start), "-i", input_video, "-t", str(duration),
+            "-vf", vf, "-loop", "0",
+            str(out_path),
+        ]
+
+    with st.spinner(f"Exporting {out_path.name}..."):
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed: {result.stderr[:200]}")
+    return out_path
 
 
 def _run_step(step_name: str, config_override: dict | None = None):
@@ -688,6 +1084,10 @@ def _load_clips(job_path: str) -> list:
         with open(clips_path, "r", encoding="utf-8") as f:
             clips = json.load(f)
         if clips:
+            # Backward compat: default is_highlight to False for old data
+            for c in clips:
+                if "is_highlight" not in c:
+                    c["is_highlight"] = False
             return clips
 
     # Fallback: load from rallies.json if manual_clips is missing/empty
@@ -706,6 +1106,7 @@ def _load_clips(job_path: str) -> list:
                     "clip_start": r["start"],
                     "clip_end": end,
                     "label": f"Rally {r['id']}",
+                    "is_highlight": False,
                     "conf_audio": r.get("conf_audio", 0),
                     "conf_video": r.get("conf_video", 0),
                     "impact_count": r.get("impact_count", 0),

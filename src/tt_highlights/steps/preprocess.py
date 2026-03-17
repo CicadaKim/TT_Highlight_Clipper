@@ -28,14 +28,14 @@ def run(job: dict, config: dict, job_path: str) -> None:
     # 1) Probe input video for metadata
     meta = _probe_video(input_video)
 
-    # 2) Generate proxy video (scaled, fps adjusted, no audio)
+    # 2) Generate proxy video (scaled, fps adjusted, with audio)
     logger.info("Generating proxy video...")
     _run_ffmpeg([
         "ffmpeg", "-y", "-i", input_video,
         "-vf", f"scale=-2:{proxy_height},fps={proxy_fps}",
-        "-an",  # no audio
         "-c:v", "libx264", "-pix_fmt", "yuv420p",
         "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart",
         str(proxy_path),
     ])

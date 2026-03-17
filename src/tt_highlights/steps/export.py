@@ -33,40 +33,66 @@ def run(job: dict, config: dict, job_path: str) -> None:
         logger.warning("No highlights to export.")
         return
 
-    # Extract individual clips
+    export_cfg = config.get("export", {})
+    export_format = export_cfg.get("export_format", "both")  # "both", "video", "gif"
+
+    # Extract individual clips (video)
     exported_clips = []
-    for hl in highlights:
-        rank = hl["rank"]
-        category = hl["category"]
-        clip_start = hl["clip_start"]
-        clip_end = hl["clip_end"]
+    if export_format in ("both", "video"):
+        for hl in highlights:
+            rank = hl["rank"]
+            category = hl["category"]
+            clip_start = hl["clip_start"]
+            clip_end = hl["clip_end"]
 
-        clip_name = f"clip_{rank:03d}_{category}.mp4"
-        clip_path = clips_dir / clip_name
+            clip_name = f"clip_{rank:03d}_{category}.mp4"
+            clip_path = clips_dir / clip_name
 
-        logger.info(f"Exporting {clip_name}: [{clip_start:.1f}-{clip_end:.1f}]")
+            logger.info(f"Exporting {clip_name}: [{clip_start:.1f}-{clip_end:.1f}]")
 
-        try:
-            clip_duration = clip_end - clip_start
-            _run_ffmpeg([
-                "ffmpeg", "-y",
-                "-ss", str(clip_start),
-                "-i", input_video,
-                "-t", str(clip_duration),
-                "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-                "-pix_fmt", "yuv420p",
-                "-profile:v", "high", "-level", "4.1",
-                "-c:a", "aac", "-b:a", "192k",
-                "-movflags", "+faststart",
-                str(clip_path),
-            ])
-            exported_clips.append(clip_path)
-        except RuntimeError as e:
-            logger.error(f"Failed to export {clip_name}: {e}")
-            continue
+            try:
+                clip_duration = clip_end - clip_start
+                _run_ffmpeg([
+                    "ffmpeg", "-y",
+                    "-ss", str(clip_start),
+                    "-i", input_video,
+                    "-t", str(clip_duration),
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                    "-pix_fmt", "yuv420p",
+                    "-profile:v", "high", "-level", "4.1",
+                    "-c:a", "aac", "-b:a", "192k",
+                    "-movflags", "+faststart",
+                    str(clip_path),
+                ])
+                exported_clips.append(clip_path)
+            except RuntimeError as e:
+                logger.error(f"Failed to export {clip_name}: {e}")
+                continue
 
-    if not exported_clips:
+    # Generate GIF for each exported clip
+    if export_format in ("both", "gif") and export_cfg.get("gif_enabled", True):
+        gif_width = export_cfg.get("gif_width", 320)
+        gif_fps = export_cfg.get("gif_fps", 10)
+        for hl in highlights:
+            rank = hl["rank"]
+            category = hl["category"]
+            gif_name = f"clip_{rank:03d}_{category}.gif"
+            gif_path = clips_dir / gif_name
+            clip_duration = hl["clip_end"] - hl["clip_start"]
+            try:
+                _export_gif(
+                    input_video, hl["clip_start"], clip_duration,
+                    gif_path, width=gif_width, fps=gif_fps,
+                )
+            except RuntimeError as e:
+                logger.warning(f"GIF failed for {gif_name}: {e}")
+
+    if export_format in ("both", "video") and not exported_clips:
         logger.error("No clips were exported successfully.")
+        return
+
+    if export_format == "gif":
+        logger.info(f"GIF-only export done: {len(highlights)} clips")
         return
 
     # Create highlights reel via concat
@@ -101,6 +127,20 @@ def run(job: dict, config: dict, job_path: str) -> None:
     concat_list.unlink(missing_ok=True)
 
     logger.info(f"Export done: {len(exported_clips)} clips + reel")
+
+
+def _export_gif(input_video: str, start: float, duration: float,
+                output_path: Path, width: int = 320, fps: int = 10) -> None:
+    """Generate a high-quality GIF using palette-based encoding."""
+    vf = (f"fps={fps},scale={width}:-1:flags=lanczos,"
+          f"split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse")
+    _run_ffmpeg([
+        "ffmpeg", "-y",
+        "-ss", str(start), "-i", input_video, "-t", str(duration),
+        "-vf", vf, "-loop", "0",
+        str(output_path),
+    ])
+    logger.info(f"GIF created: {output_path.name}")
 
 
 def _run_ffmpeg(cmd: list[str]) -> None:

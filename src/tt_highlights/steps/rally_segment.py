@@ -143,6 +143,11 @@ def run(job: dict, config: dict, job_path: str) -> None:
                          f"low activity ({mean_act:.3f})")
             continue
         r["conf_video"] = round(mean_act, 4)
+        vid_floor = scfg.get("conf_video_floor", 0.03)
+        vid_ceil = scfg.get("conf_video_ceil", 0.12)
+        r["conf_video_norm"] = round(
+            min(1.0, max(0.0, (mean_act - vid_floor) / (vid_ceil - vid_floor))), 4
+        )
         activity_filtered.append(r)
 
     # --- [NEW] Step 7: Rhythm pattern score ---

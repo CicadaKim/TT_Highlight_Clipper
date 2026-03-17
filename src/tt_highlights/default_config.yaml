@@ -23,16 +23,18 @@ segmentation:
   min_rally_duration_sec: 2.5
   end_grace_sec: 1.8
   activity_min_mean: 0.05
-  split_min_duration_sec: 8.0
+  split_min_duration_sec: 5.0
   split_activity_max: 0.025
   split_min_window_sec: 1.0
   impact_score_floor: 0.04
   gap_multiplier: 2.5
   gap_min_sec: 2.0
-  merge_gap_sec: 2.0
+  merge_gap_sec: 1.0
   boundary_look_back_sec: 2.0
   boundary_look_fwd_sec: 1.0
   boundary_grad_threshold: 0.02
+  conf_video_floor: 0.03
+  conf_video_ceil: 0.12
   require_video_confirmation: false
   video_confirm_window_sec: 0.5
   video_confirm_threshold: 0.03
@@ -66,6 +68,15 @@ clips:
   pre_roll_sec: 1.0
   post_roll_sec: 1.5
   overlap_sec: 2.0
+
+export:
+  gif_enabled: true
+  gif_width: 640
+  gif_fps: 20
+
+highlights:
+  auto_threshold: 0.4
+  video_floor: 0.03
 
 scoring:
   weights:
