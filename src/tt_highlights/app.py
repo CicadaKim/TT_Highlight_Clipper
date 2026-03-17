@@ -487,6 +487,32 @@ def _screen_clip_editor():
         },
     }
 
+    # ── Saved parameter suggestions ──────────────────────────────────────
+    saved_sugg = _load_parameter_suggestions()
+    if saved_sugg and saved_sugg.get("suggestions"):
+        sugg = saved_sugg["suggestions"]
+        col_sl, col_sr = st.columns(2)
+        with col_sl:
+            if st.button("Load Previous Suggestions", key="load_suggestions"):
+                for param_key, value in sugg.items():
+                    widget_key = _PARAM_KEY_MAP.get(param_key)
+                    if widget_key:
+                        st.session_state[widget_key] = value
+                st.success("Suggestions loaded into sliders.")
+                st.rerun()
+        with col_sr:
+            if st.button("Revert Suggestions", key="revert_suggestions"):
+                art_dir = artifacts_dir(st.session_state.job_path)
+                sugg_path = art_dir / "parameter_suggestions.json"
+                if sugg_path.exists():
+                    sugg_path.unlink()
+                st.success("Suggestions reverted.")
+                st.rerun()
+        st.caption(
+            f"Saved suggestions: {sugg} "
+            f"(from {saved_sugg.get('created_at', '?')[:10]})"
+        )
+
     # Gate: setup must be complete before auto-detect
     if not is_setup_complete(st.session_state.job_path):
         st.warning("ROI setup not completed. Go to Setup screen and run ROI detection first.")
@@ -611,10 +637,16 @@ def _screen_clip_editor():
 
             elif action == "delete_clip":
                 clip_id = component_value.get("clip_id")
+                rally_id = None
+                for c in st.session_state.clips:
+                    if c["id"] == clip_id:
+                        rally_id = c.get("rally_id")
+                        break
                 st.session_state.clips = [
                     c for c in st.session_state.clips if c["id"] != clip_id
                 ]
                 _save_clips(st.session_state.job_path, st.session_state.clips)
+                _record_feedback_label(clip_id, rally_id, "exclude")
                 st.rerun()
 
             elif action == "resize_clip":
@@ -632,11 +664,17 @@ def _screen_clip_editor():
             elif action == "toggle_highlight":
                 clip_id = component_value.get("clip_id")
                 is_highlight = component_value.get("is_highlight", False)
+                rally_id = None
                 for c in st.session_state.clips:
                     if c["id"] == clip_id:
                         c["is_highlight"] = is_highlight
+                        rally_id = c.get("rally_id")
                         break
                 _save_clips(st.session_state.job_path, st.session_state.clips)
+                _record_feedback_label(
+                    clip_id, rally_id,
+                    "highlight" if is_highlight else "unhighlight",
+                )
                 st.rerun()
 
             elif action == "clear_all_clips":
@@ -988,6 +1026,8 @@ def _render_missed_diagnosis(result) -> None:
                 widget_key = _PARAM_KEY_MAP.get(param_key)
                 if widget_key:
                     st.session_state[widget_key] = value
+            # Save suggestion artifact
+            _save_parameter_suggestions(result.suggestions, clip_id=None)
             del st.session_state._diagnosis
             st.rerun()
 
@@ -1169,6 +1209,54 @@ def _roi_canvas_editor(art: Path, frame0_path: Path) -> None:
                     st.warning("No rectangle drawn.")
             else:
                 st.warning("No rectangle drawn.")
+
+
+def _save_parameter_suggestions(suggestions: dict, clip_id: int | None) -> None:
+    """Persist parameter suggestions to artifact file."""
+    from datetime import datetime, timezone
+    art = artifacts_dir(st.session_state.job_path)
+    artifact = {
+        "suggestions": suggestions,
+        "source_clip_id": clip_id,
+        "applied": True,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with open(art / "parameter_suggestions.json", "w", encoding="utf-8") as f:
+        json.dump(artifact, f, indent=2)
+
+
+def _load_parameter_suggestions() -> dict | None:
+    """Load saved parameter suggestions if they exist."""
+    art = artifacts_dir(st.session_state.job_path)
+    path = art / "parameter_suggestions.json"
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+
+def _record_feedback_label(
+    clip_id: int, rally_id: int | None, action: str,
+) -> None:
+    """Append a feedback label entry to feedback_labels.json."""
+    from datetime import datetime, timezone
+    art = artifacts_dir(st.session_state.job_path)
+    path = art / "feedback_labels.json"
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        data = {"labels": []}
+
+    data["labels"].append({
+        "clip_id": clip_id,
+        "rally_id": rally_id,
+        "action": action,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 
 
 def _mark_setup_complete(art: Path) -> None:
