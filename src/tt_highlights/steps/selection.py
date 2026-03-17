@@ -1,4 +1,16 @@
-"""Step: selection – choose final highlights and compute dynamic clip windows."""
+"""Step: selection – choose final highlights with hybrid clip windows.
+
+Hybrid selection:
+  - Short rallies (duration < 70% of clip_length): dynamic window
+    [rally_start - pre_roll, rally_end + post_roll]
+  - Long rallies (duration >= 70% of clip_length): anchored fixed-length
+    clip centered on an anchor point, with length = clip_length
+
+Anchor rules by category:
+  - reaction: end_refined + post_roll (end anchor)
+  - impact: impact_peak_t > ball_speed_peak_t > rally midpoint
+  - long_rally: densest impact window center > dynamic fallback
+"""
 
 import json
 import logging
@@ -90,15 +102,19 @@ def run(job: dict, config: dict, job_path: str) -> None:
                     best_score = c["score"]
                     best_cat = cat
         if best_cat:
-            clip_start, clip_end = _compute_window(
+            window = _compute_window(
                 rally, best_cat, features_by_id.get(rid, {}),
                 clip_length, pre_roll, post_roll, video_duration
             )
             selected.append({
                 "category": best_cat,
                 "rally_id": rid,
-                "clip_start": clip_start,
-                "clip_end": clip_end,
+                "clip_start": window["clip_start"],
+                "clip_end": window["clip_end"],
+                "clip_mode": window["clip_mode"],
+                "clip_length_sec": window["clip_length_sec"],
+                "anchor_t": window["anchor_t"],
+                "anchor_reason": window["anchor_reason"],
                 "score": best_score,
                 "reasons": ["pinned"],
             })
@@ -119,20 +135,25 @@ def run(job: dict, config: dict, job_path: str) -> None:
                 continue
 
             rally = rallies_by_id[rid]
-            clip_start, clip_end = _compute_window(
+            window = _compute_window(
                 rally, cat, features_by_id.get(rid, {}),
                 clip_length, pre_roll, post_roll, video_duration
             )
 
             # Check overlap with existing selections
-            if _has_overlap(clip_start, clip_end, selected, overlap_sec):
+            if _has_overlap(window["clip_start"], window["clip_end"],
+                            selected, overlap_sec):
                 continue
 
             selected.append({
                 "category": cat,
                 "rally_id": rid,
-                "clip_start": clip_start,
-                "clip_end": clip_end,
+                "clip_start": window["clip_start"],
+                "clip_end": window["clip_end"],
+                "clip_mode": window["clip_mode"],
+                "clip_length_sec": window["clip_length_sec"],
+                "anchor_t": window["anchor_t"],
+                "anchor_reason": window["anchor_reason"],
                 "score": cand["score"],
                 "reasons": cand.get("reasons", []),
             })
@@ -157,19 +178,24 @@ def run(job: dict, config: dict, job_path: str) -> None:
                 continue
 
             rally = rallies_by_id[rid]
-            clip_start, clip_end = _compute_window(
+            window = _compute_window(
                 rally, cat, features_by_id.get(rid, {}),
                 clip_length, pre_roll, post_roll, video_duration
             )
 
-            if _has_overlap(clip_start, clip_end, selected, overlap_sec):
+            if _has_overlap(window["clip_start"], window["clip_end"],
+                            selected, overlap_sec):
                 continue
 
             selected.append({
                 "category": cat,
                 "rally_id": rid,
-                "clip_start": clip_start,
-                "clip_end": clip_end,
+                "clip_start": window["clip_start"],
+                "clip_end": window["clip_end"],
+                "clip_mode": window["clip_mode"],
+                "clip_length_sec": window["clip_length_sec"],
+                "anchor_t": window["anchor_t"],
+                "anchor_reason": window["anchor_reason"],
                 "score": cand["score"],
                 "reasons": cand.get("reasons", []),
             })
@@ -181,36 +207,145 @@ def run(job: dict, config: dict, job_path: str) -> None:
         s["rank"] = i + 1
         s["clip_start"] = round(s["clip_start"], 3)
         s["clip_end"] = round(s["clip_end"], 3)
+        s["clip_length_sec"] = round(s["clip_length_sec"], 3)
         s["score"] = round(s["score"], 4)
 
+    # Determine overall clip mode
+    modes = set(s["clip_mode"] for s in selected)
+    if len(modes) == 1:
+        overall_mode = modes.pop()
+    elif modes:
+        overall_mode = "hybrid"
+    else:
+        overall_mode = "dynamic"
+
     output = {
-        "clip_mode": "dynamic",
+        "clip_mode": overall_mode,
         "highlights": selected,
     }
     with open(art / "highlights.json", "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2)
 
-    logger.info(f"Selected {len(selected)} highlights.")
+    logger.info(f"Selected {len(selected)} highlights (mode={overall_mode}).")
     for s in selected:
-        logger.info(f"  #{s['rank']} {s['category']} R{s['rally_id']} "
-                     f"[{s['clip_start']:.1f}-{s['clip_end']:.1f}] score={s['score']:.2f}")
+        logger.info(
+            f"  #{s['rank']} {s['category']} R{s['rally_id']} "
+            f"[{s['clip_start']:.1f}-{s['clip_end']:.1f}] "
+            f"mode={s['clip_mode']} score={s['score']:.2f}"
+        )
 
 
-def _compute_window(rally: dict, category: str, features: dict,
-                    clip_length: float, pre_roll: float, post_roll: float,
-                    video_duration: float) -> tuple[float, float]:
-    """Compute clip window: [rally_start - pre_roll, rally_end + post_roll]."""
+def _compute_window(
+    rally: dict, category: str, features: dict,
+    clip_length: float, pre_roll: float, post_roll: float,
+    video_duration: float,
+) -> dict:
+    """Compute clip window using hybrid strategy.
+
+    Returns dict with: clip_start, clip_end, clip_mode, clip_length_sec,
+    anchor_t, anchor_reason.
+    """
     start = rally["start"]
     end = rally.get("end_refined", rally["end"])
+    rally_duration = end - start
 
-    clip_start = start - pre_roll
-    clip_end = end + post_roll
+    # Decision: dynamic vs anchored fixed-length
+    if rally_duration >= clip_length * 0.7:
+        # Long rally → anchored fixed-length
+        anchor_t, anchor_reason = _find_anchor(
+            rally, category, features, start, end,
+        )
+        half = clip_length / 2
+        clip_start = anchor_t - half
+        clip_end = anchor_t + half
+        clip_mode = "anchored_fixed_length"
+    else:
+        # Short rally → dynamic
+        clip_start = start - pre_roll
+        clip_end = end + post_roll
+        anchor_t = None
+        anchor_reason = "dynamic"
+        clip_mode = "dynamic"
 
     # Clamp to video boundaries
     clip_start = max(0.0, clip_start)
     clip_end = min(video_duration, clip_end)
 
-    return clip_start, clip_end
+    return {
+        "clip_start": clip_start,
+        "clip_end": clip_end,
+        "clip_mode": clip_mode,
+        "clip_length_sec": clip_end - clip_start,
+        "anchor_t": round(anchor_t, 3) if anchor_t is not None else None,
+        "anchor_reason": anchor_reason,
+    }
+
+
+def _find_anchor(
+    rally: dict, category: str, features: dict,
+    start: float, end: float,
+) -> tuple[float, str]:
+    """Determine anchor point based on category.
+
+    Returns (anchor_time, reason_string).
+    """
+    midpoint = (start + end) / 2
+
+    if category == "reaction":
+        # Anchor at end: end_refined + post_roll area
+        end_refined = rally.get("end_refined", end)
+        return end_refined, "end_refined"
+
+    elif category == "impact":
+        # Priority: impact_peak_t → ball_speed_peak_t → midpoint
+        impact_peak_t = features.get("impact_peak_t")
+        if impact_peak_t is not None and start <= impact_peak_t <= end:
+            return impact_peak_t, "impact_peak_t"
+
+        ball_speed_peak_t = features.get("ball_speed_peak_t")
+        if ball_speed_peak_t is not None and start <= ball_speed_peak_t <= end:
+            return ball_speed_peak_t, "ball_speed_peak_t"
+
+        return midpoint, "rally_midpoint"
+
+    elif category == "long_rally":
+        # Densest impact window center → dynamic fallback
+        impact_times = features.get("impact_times", [])
+        if len(impact_times) >= 3:
+            center = _densest_window_center(impact_times, start, end)
+            if center is not None:
+                return center, "densest_impact_window"
+
+        return midpoint, "rally_midpoint"
+
+    # Default fallback
+    return midpoint, "rally_midpoint"
+
+
+def _densest_window_center(
+    impact_times: list[float],
+    start: float,
+    end: float,
+    window_sec: float = 5.0,
+) -> float | None:
+    """Find the center of the window with the most impact events."""
+    if not impact_times:
+        return None
+
+    times = sorted(impact_times)
+    best_count = 0
+    best_center = None
+
+    for i, t in enumerate(times):
+        # Count impacts in [t, t + window_sec]
+        count = sum(1 for t2 in times if t <= t2 <= t + window_sec)
+        if count > best_count:
+            best_count = count
+            # Center of the window
+            window_end = min(t + window_sec, end)
+            best_center = (t + window_end) / 2
+
+    return best_center
 
 
 def _has_overlap(clip_start: float, clip_end: float,
