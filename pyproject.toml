@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tt-highlight-clipper"
+version = "0.1.0"
+description = "Automated table tennis highlight extraction"
+requires-python = ">=3.11"
+
+[project.scripts]
+tt-highlights = "tt_highlights.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]

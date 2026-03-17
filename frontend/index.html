@@ -1,0 +1,748 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Video Clip Editor</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0e1117; color: #fafafa; }
+
+/* ── Video Player ─────────────────────────────────────── */
+.video-container { position: relative; width: 100%; background: #000; border-radius: 8px; overflow: hidden; }
+.video-container video { width: 100%; display: block; }
+.video-controls {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px; background: #1a1d24;
+}
+.video-controls button {
+  background: #262b36; border: none; color: #fafafa; padding: 6px 14px;
+  border-radius: 4px; cursor: pointer; font-size: 13px;
+}
+.video-controls button:hover { background: #3a3f4b; }
+.time-display { font-size: 13px; color: #aaa; font-variant-numeric: tabular-nums; }
+
+/* ── Timeline ─────────────────────────────────────────── */
+.timeline-section { margin-top: 4px; }
+.timeline-canvas-wrap {
+  position: relative; width: 100%; height: 72px;
+  background: #1a1d24; border-radius: 6px; overflow: hidden; cursor: crosshair;
+}
+.timeline-canvas-wrap canvas { position: absolute; top: 0; left: 0; }
+
+/* ── Selection info bar ───────────────────────────────── */
+.selection-bar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 12px; background: #1a1d24; border-radius: 0 0 6px 6px;
+  min-height: 32px;
+}
+.selection-bar span { font-size: 12px; color: #aaa; }
+.selection-bar button {
+  background: #ff4b4b; border: none; color: #fff; padding: 4px 12px;
+  border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 600;
+}
+.selection-bar button:hover { background: #ff6b6b; }
+
+/* ── Clip List ────────────────────────────────────────── */
+.clip-list { margin-top: 8px; }
+.clip-list-header {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 13px; font-weight: 600; color: #888; padding: 4px 0;
+}
+.clip-item {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 7px 10px; border-radius: 5px; cursor: pointer;
+  transition: background 0.15s;
+}
+.clip-item:hover { background: #262b36; }
+.clip-item.active { background: #1e3a5f; }
+.clip-color {
+  width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+}
+.clip-label { flex: 1; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.clip-time { font-size: 12px; color: #888; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.clip-del {
+  background: #5c1a1a; border: 1px solid #ff4b4b; color: #ff8a8a; padding: 3px 10px;
+  border-radius: 4px; cursor: pointer; font-size: 11px; font-weight: 600;
+}
+.clip-del:hover { background: #ff4b4b; color: #fff; }
+
+.clip-clear-all {
+  background: #3a1a1a; border: 1px solid #ff4b4b; color: #ff8a8a; padding: 3px 10px;
+  border-radius: 4px; cursor: pointer; font-size: 11px; font-weight: 600; margin-left: auto;
+}
+.clip-clear-all:hover { background: #ff4b4b; color: #fff; }
+
+.clip-main-row { display: flex; align-items: center; gap: 8px; width: 100%; }
+.clip-meta { display: flex; gap: 4px; padding-left: 18px; margin-top: 2px; flex-wrap: wrap; }
+.badge { font-size: 10px; padding: 1px 5px; border-radius: 3px; font-weight: 600; }
+.badge-audio { background: #1a3a1a; color: #4bff88; }
+.badge-video { background: #1a2a3a; color: #4bafff; }
+.badge-impact { background: #3a2a1a; color: #ffcf4b; }
+.badge-reason { background: #2a1a3a; color: #c74bff; }
+.empty-msg { font-size: 13px; color: #666; padding: 12px 0; }
+</style>
+</head>
+<body>
+<div id="app">
+  <!-- Video Player -->
+  <div class="video-container">
+    <video id="video" preload="auto"></video>
+    <div class="video-controls">
+      <button id="btn-play">&#9654; Play</button>
+      <span class="time-display" id="time-display">0:00 / 0:00</span>
+    </div>
+  </div>
+
+  <!-- Timeline -->
+  <div class="timeline-section">
+    <div class="timeline-canvas-wrap" id="timeline-wrap">
+      <canvas id="timeline-bg"></canvas>
+      <canvas id="timeline-fg"></canvas>
+      <div id="clip-overlay-buttons" style="position:absolute; top:0; left:0; width:100%; height:100%; pointer-events:none;"></div>
+    </div>
+    <div class="selection-bar" id="selection-bar">
+      <span id="selection-text">Click timeline to seek. Drag to select a range.</span>
+      <button id="btn-add-clip" style="display:none;">+ Add Clip</button>
+    </div>
+  </div>
+
+  <!-- Clip List -->
+  <div class="clip-list">
+    <div class="clip-list-header" id="clip-list-header">Clips (0)</div>
+    <div id="clip-list-items"></div>
+  </div>
+</div>
+
+<script>
+/* ================================================================
+   Streamlit Custom Component — Interactive Video Clip Editor
+   Uses raw postMessage API (no npm build needed)
+   ================================================================ */
+
+// ── Streamlit iframe communication helpers ───────────────
+function sendMessageToStreamlit(type, data) {
+  window.parent.postMessage(
+    Object.assign({ isStreamlitMessage: true, type: type }, data),
+    "*"
+  );
+}
+
+function setComponentReady() {
+  sendMessageToStreamlit("streamlit:componentReady", { apiVersion: 1 });
+}
+
+function setComponentValue(value) {
+  sendMessageToStreamlit("streamlit:setComponentValue", { value: value });
+}
+
+function setFrameHeight(height) {
+  height = height || document.body.scrollHeight;
+  sendMessageToStreamlit("streamlit:setFrameHeight", { height: height });
+}
+
+// ── Constants ────────────────────────────────────────────
+const CLIP_COLORS = [
+  "#ff4b4b","#4bafff","#4bff88","#ffcf4b","#c74bff",
+  "#ff4ba8","#4bfff0","#ff8c4b","#8c4bff","#4bff4b",
+];
+
+// ── State ────────────────────────────────────────────────
+let videoUrl = "";
+let duration = 0;
+let fps = 30;
+let clips = [];
+let markers = [];
+let activity = [];
+let cheers = [];
+let activeClipId = null;
+
+// Drag / selection
+let isDragging = false;
+let dragStartX = 0;
+let selStart = -1;
+let selEnd = -1;
+
+// Resize clip edges
+let isResizing = null;  // "start" | "end" | null
+let resizingClipId = null;
+
+// Playhead animation
+let animFrameId = null;
+
+// Saved playback position (survives rerenders)
+let savedCurrentTime = 0;
+let wasPlaying = false;
+
+// ── DOM refs ─────────────────────────────────────────────
+const video      = document.getElementById("video");
+const btnPlay    = document.getElementById("btn-play");
+const timeDisp   = document.getElementById("time-display");
+const tlWrap     = document.getElementById("timeline-wrap");
+const bgCanvas   = document.getElementById("timeline-bg");
+const fgCanvas   = document.getElementById("timeline-fg");
+const selText    = document.getElementById("selection-text");
+const btnAddClip = document.getElementById("btn-add-clip");
+const clipHeader = document.getElementById("clip-list-header");
+const clipItems  = document.getElementById("clip-list-items");
+
+// ── Utilities ────────────────────────────────────────────
+function fmtTime(sec) {
+  if (!isFinite(sec) || sec < 0) sec = 0;
+  var m = Math.floor(sec / 60);
+  var s = Math.floor(sec % 60);
+  return m + ":" + (s < 10 ? "0" : "") + s;
+}
+
+function fmtTimePrecise(sec) {
+  if (!isFinite(sec) || sec < 0) sec = 0;
+  var m = Math.floor(sec / 60);
+  var s = (sec % 60).toFixed(1);
+  return m + ":" + (parseFloat(s) < 10 ? "0" : "") + s;
+}
+
+function clipColor(idx) {
+  return CLIP_COLORS[idx % CLIP_COLORS.length];
+}
+
+function xToTime(x) {
+  var rect = fgCanvas.getBoundingClientRect();
+  return Math.max(0, Math.min(duration, (x - rect.left) / rect.width * duration));
+}
+
+function timeToX(t) {
+  return (t / duration) * fgCanvas.getBoundingClientRect().width;
+}
+
+// Returns "start", "end", or null — checks if clientX is near active clip's edge
+function hitActiveClipEdge(clientX) {
+  if (activeClipId === null || duration <= 0) return null;
+  var ac = clips.find(function(c) { return c.id === activeClipId; });
+  if (!ac) return null;
+  var rect = fgCanvas.getBoundingClientRect();
+  var startX = (ac.clip_start / duration) * rect.width + rect.left;
+  var endX = (ac.clip_end / duration) * rect.width + rect.left;
+  if (Math.abs(clientX - startX) <= 6) return "start";
+  if (Math.abs(clientX - endX) <= 6) return "end";
+  return null;
+}
+
+// ── Video controls ───────────────────────────────────────
+video.addEventListener("error", function() {
+  var e = video.error;
+  var msg = e ? "Video error: code=" + e.code + " " + (e.message || "") : "Unknown video error";
+  console.error(msg);
+  selText.textContent = msg;
+});
+
+btnPlay.addEventListener("click", function() {
+  if (video.paused) { video.play(); }
+  else { video.pause(); }
+});
+
+video.addEventListener("play",  function() { btnPlay.innerHTML = "&#9646;&#9646; Pause"; startPlayheadLoop(); });
+video.addEventListener("pause", function() { btnPlay.innerHTML = "&#9654; Play";  stopPlayheadLoop(); });
+
+video.addEventListener("timeupdate", function() {
+  savedCurrentTime = video.currentTime;
+  timeDisp.textContent = fmtTime(video.currentTime) + " / " + fmtTime(duration);
+
+  // Loop playback within active clip bounds
+  if (activeClipId !== null) {
+    var ac = clips.find(function(c) { return c.id === activeClipId; });
+    if (ac && video.currentTime >= ac.clip_end) {
+      video.currentTime = ac.clip_start;
+    }
+  }
+});
+
+video.addEventListener("loadedmetadata", function() {
+  if (savedCurrentTime > 0 && savedCurrentTime < video.duration) {
+    video.currentTime = savedCurrentTime;
+  }
+  if (wasPlaying) { video.play(); }
+});
+
+// ── Playhead animation loop ──────────────────────────────
+function startPlayheadLoop() {
+  if (animFrameId) return;
+  (function tick() {
+    // Loop boundary check at ~60Hz for accuracy on short clips
+    if (activeClipId !== null) {
+      var ac = clips.find(function(c) { return c.id === activeClipId; });
+      if (ac && video.currentTime >= ac.clip_end) {
+        video.currentTime = ac.clip_start;
+      }
+    }
+    drawForeground();
+    animFrameId = requestAnimationFrame(tick);
+  })();
+}
+function stopPlayheadLoop() {
+  if (animFrameId) { cancelAnimationFrame(animFrameId); animFrameId = null; }
+  drawForeground();
+}
+
+// ── Timeline drawing ─────────────────────────────────────
+function resizeCanvases() {
+  var w = tlWrap.clientWidth;
+  var h = tlWrap.clientHeight;
+  var dpr = window.devicePixelRatio || 1;
+  [bgCanvas, fgCanvas].forEach(function(c) {
+    c.width = w * dpr;
+    c.height = h * dpr;
+    c.style.width = w + "px";
+    c.style.height = h + "px";
+    c.getContext("2d").setTransform(dpr, 0, 0, dpr, 0, 0);
+  });
+}
+
+function drawBackground() {
+  var ctx = bgCanvas.getContext("2d");
+  var w = tlWrap.clientWidth;
+  var h = tlWrap.clientHeight;
+  ctx.clearRect(0, 0, w, h);
+
+  if (duration <= 0) return;
+
+  // Time ruler
+  var step = duration <= 60 ? 5 : duration <= 300 ? 10 : 30;
+  ctx.fillStyle = "#555";
+  ctx.font = "10px sans-serif";
+  ctx.textBaseline = "top";
+  for (var t = 0; t <= duration; t += step) {
+    var x = (t / duration) * w;
+    ctx.fillRect(x, 0, 1, 8);
+    ctx.fillText(fmtTime(t), x + 2, 1);
+  }
+
+  // Activity curve (background)
+  if (activity.length > 0) {
+    ctx.save();
+    ctx.globalAlpha = 0.25;
+    ctx.fillStyle = "#4bafff";
+    ctx.beginPath();
+    ctx.moveTo(0, h);
+    for (var ai = 0; ai < activity.length; ai++) {
+      var ax = (activity[ai].t / duration) * w;
+      var ay = h - activity[ai].activity * (h - 12);
+      ctx.lineTo(ax, ay);
+    }
+    ctx.lineTo(w, h);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Cheer segments
+  if (cheers.length > 0) {
+    ctx.fillStyle = "rgba(255,165,0,0.15)";
+    for (var ci = 0; ci < cheers.length; ci++) {
+      var cx1 = (cheers[ci].start / duration) * w;
+      var cx2 = (cheers[ci].end / duration) * w;
+      ctx.fillRect(cx1, 0, cx2 - cx1, h);
+    }
+  }
+
+  // Marker ticks (audio events)
+  if (markers.length > 0) {
+    ctx.fillStyle = "rgba(255,200,0,0.5)";
+    for (var mi = 0; mi < markers.length; mi++) {
+      var mx = (markers[mi] / duration) * w;
+      ctx.fillRect(mx, h - 6, 1.5, 6);
+    }
+  }
+
+  // Clip bars
+  var barY = 18;
+  var barH = h - 28;
+  clips.forEach(function(clip, i) {
+    var x1 = (clip.clip_start / duration) * w;
+    var x2 = (clip.clip_end / duration) * w;
+    var isActive = clip.id === activeClipId;
+    ctx.fillStyle = clipColor(i) + (isActive ? "66" : "44");
+    ctx.fillRect(x1, barY, x2 - x1, barH);
+    ctx.fillStyle = clipColor(i);
+    ctx.fillRect(x1, barY, isActive ? 3 : 2, barH);
+    ctx.fillRect(x2 - (isActive ? 3 : 2), barY, isActive ? 3 : 2, barH);
+
+    // Active clip border highlight
+    if (isActive) {
+      ctx.strokeStyle = clipColor(i);
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x1, barY, x2 - x1, barH);
+    }
+
+    // Label
+    var labelW = x2 - x1;
+    if (labelW > 30) {
+      ctx.fillStyle = clipColor(i);
+      ctx.font = "bold 10px sans-serif";
+      ctx.textBaseline = "middle";
+      ctx.fillText(clip.label || ("#" + clip.id), x1 + 5, barY + barH / 2, labelW - 10);
+    }
+  });
+}
+
+function drawForeground() {
+  var ctx = fgCanvas.getContext("2d");
+  var w = tlWrap.clientWidth;
+  var h = tlWrap.clientHeight;
+  ctx.clearRect(0, 0, w, h);
+
+  if (duration <= 0) return;
+
+  // Ghost selection
+  if (selStart >= 0 && selEnd >= 0 && selStart !== selEnd) {
+    var sx1 = (Math.min(selStart, selEnd) / duration) * w;
+    var sx2 = (Math.max(selStart, selEnd) / duration) * w;
+    ctx.fillStyle = "rgba(255,75,75,0.18)";
+    ctx.fillRect(sx1, 0, sx2 - sx1, h);
+    ctx.strokeStyle = "#ff4b4b";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(sx1, 0, sx2 - sx1, h);
+  }
+
+  // Playhead
+  var px = (video.currentTime / duration) * w;
+  ctx.fillStyle = "#ff4b4b";
+  ctx.fillRect(px - 1, 0, 2, h);
+  // Triangle head
+  ctx.beginPath();
+  ctx.moveTo(px - 5, 0);
+  ctx.lineTo(px + 5, 0);
+  ctx.lineTo(px, 7);
+  ctx.closePath();
+  ctx.fill();
+}
+
+// ── Timeline mouse events ────────────────────────────────
+fgCanvas.addEventListener("mousedown", function(e) {
+  // Check if we're on an active clip's edge for resize
+  var edge = hitActiveClipEdge(e.clientX);
+  if (edge) {
+    isResizing = edge;
+    resizingClipId = activeClipId;
+    return;
+  }
+
+  isDragging = true;
+  dragStartX = e.clientX;
+  selStart = xToTime(e.clientX);
+  selEnd = selStart;
+  drawForeground();
+});
+
+fgCanvas.addEventListener("mousemove", function(e) {
+  // Resize mode: update clip boundary in real-time
+  if (isResizing && resizingClipId !== null) {
+    var t = xToTime(e.clientX);
+    var ac = clips.find(function(c) { return c.id === resizingClipId; });
+    if (ac) {
+      if (isResizing === "start" && t < ac.clip_end) {
+        ac.clip_start = Math.round(t * 10) / 10;
+      } else if (isResizing === "end" && t > ac.clip_start) {
+        ac.clip_end = Math.round(t * 10) / 10;
+      }
+      drawBackground();
+      drawForeground();
+      renderClipList();
+      renderClipOverlays();
+    }
+    return;
+  }
+
+  // Update cursor based on edge proximity
+  var edge = hitActiveClipEdge(e.clientX);
+  fgCanvas.style.cursor = edge ? "col-resize" : "crosshair";
+
+  if (!isDragging) return;
+  selEnd = xToTime(e.clientX);
+  drawForeground();
+});
+
+window.addEventListener("mouseup", function(e) {
+  // Finish resize — send update to Streamlit
+  if (isResizing && resizingClipId !== null) {
+    var ac = clips.find(function(c) { return c.id === resizingClipId; });
+    if (ac) {
+      setComponentValue({
+        action: "resize_clip",
+        clip_id: resizingClipId,
+        start: ac.clip_start,
+        end: ac.clip_end,
+        _ts: Date.now()
+      });
+    }
+    isResizing = null;
+    resizingClipId = null;
+    return;
+  }
+
+  if (!isDragging) return;
+  isDragging = false;
+  selEnd = xToTime(e.clientX);
+
+  var dist = Math.abs(e.clientX - dragStartX);
+  if (dist < 5) {
+    // Click — seek & release loop
+    activeClipId = null;
+    video.currentTime = selStart;
+    selStart = -1;
+    selEnd = -1;
+    selText.textContent = "Click timeline to seek. Drag to select a range.";
+    btnAddClip.style.display = "none";
+    renderClipList();
+    renderClipOverlays();
+    drawBackground();
+    drawForeground();
+    return;
+  }
+
+  // Drag — select range
+  var s = Math.min(selStart, selEnd);
+  var en = Math.max(selStart, selEnd);
+  selStart = s;
+  selEnd = en;
+  selText.textContent = "Selection: " + fmtTimePrecise(s) + " - " + fmtTimePrecise(en) + " (" + (en - s).toFixed(1) + "s)";
+  btnAddClip.style.display = "inline-block";
+  drawForeground();
+});
+
+// ── Add clip from selection ──────────────────────────────
+btnAddClip.addEventListener("click", function() {
+  if (selStart < 0 || selEnd < 0 || selStart === selEnd) return;
+  var s = Math.min(selStart, selEnd);
+  var en = Math.max(selStart, selEnd);
+  setComponentValue({
+    action: "add_clip",
+    clip: {
+      start: Math.round(s * 10) / 10,
+      end: Math.round(en * 10) / 10,
+      label: "",
+    },
+    _ts: Date.now()
+  });
+  selStart = -1;
+  selEnd = -1;
+  btnAddClip.style.display = "none";
+  selText.textContent = "Clip added!";
+});
+
+// ── Clip list rendering ──────────────────────────────────
+function renderClipList() {
+  clipHeader.innerHTML = "";
+  var headerText = document.createElement("span");
+  headerText.textContent = "Clips (" + clips.length + ")";
+  clipHeader.appendChild(headerText);
+
+  if (clips.length > 0) {
+    var clearBtn = document.createElement("button");
+    clearBtn.className = "clip-clear-all";
+    clearBtn.textContent = "Clear All";
+    clearBtn.addEventListener("click", function() {
+      setComponentValue({ action: "clear_all_clips", _ts: Date.now() });
+    });
+    clipHeader.appendChild(clearBtn);
+  }
+
+  clipItems.innerHTML = "";
+
+  if (clips.length === 0) {
+    clipItems.innerHTML = '<div class="empty-msg">No clips. Drag on the timeline or use Auto-detect.</div>';
+    return;
+  }
+
+  var sorted = clips.slice().sort(function(a, b) { return a.clip_start - b.clip_start; });
+
+  sorted.forEach(function(clip, i) {
+    var div = document.createElement("div");
+    div.className = "clip-item" + (clip.id === activeClipId ? " active" : "");
+
+    var dot = document.createElement("span");
+    dot.className = "clip-color";
+    dot.style.background = clipColor(i);
+
+    var label = document.createElement("span");
+    label.className = "clip-label";
+    label.textContent = clip.label || ("Clip #" + clip.id);
+
+    var time = document.createElement("span");
+    time.className = "clip-time";
+    time.textContent = fmtTimePrecise(clip.clip_start) + " - " + fmtTimePrecise(clip.clip_end);
+
+    var delBtn = document.createElement("button");
+    delBtn.className = "clip-del";
+    delBtn.textContent = "Del";
+    delBtn.addEventListener("click", (function(cid) {
+      return function(e) {
+        e.stopPropagation();
+        setComponentValue({ action: "delete_clip", clip_id: cid, _ts: Date.now() });
+      };
+    })(clip.id));
+
+    var mainRow = document.createElement("div");
+    mainRow.className = "clip-main-row";
+    mainRow.appendChild(dot);
+    mainRow.appendChild(label);
+    mainRow.appendChild(time);
+    mainRow.appendChild(delBtn);
+    div.appendChild(mainRow);
+
+    // Metadata badges (auto-detected clips only)
+    if (clip.conf_audio !== undefined) {
+      var metaDiv = document.createElement("div");
+      metaDiv.className = "clip-meta";
+
+      var badgeAudio = document.createElement("span");
+      badgeAudio.className = "badge badge-audio";
+      badgeAudio.textContent = "\uC74C\uC131 " + Math.round(clip.conf_audio * 100) + "%";
+      metaDiv.appendChild(badgeAudio);
+
+      if (clip.conf_video !== undefined) {
+        var badgeVideo = document.createElement("span");
+        badgeVideo.className = "badge badge-video";
+        badgeVideo.textContent = "\uC601\uC0C1 " + Math.round(clip.conf_video * 100) + "%";
+        metaDiv.appendChild(badgeVideo);
+      }
+
+      if (clip.impact_count !== undefined) {
+        var badgeImpact = document.createElement("span");
+        badgeImpact.className = "badge badge-impact";
+        badgeImpact.textContent = clip.impact_count + "\uD0C0";
+        metaDiv.appendChild(badgeImpact);
+      }
+
+      if (clip.reason_end) {
+        var badgeReason = document.createElement("span");
+        badgeReason.className = "badge badge-reason";
+        badgeReason.textContent = clip.reason_end;
+        metaDiv.appendChild(badgeReason);
+      }
+
+      div.appendChild(metaDiv);
+    }
+
+    div.addEventListener("click", (function(c) {
+      return function() {
+        if (activeClipId === c.id) {
+          activeClipId = null;
+        } else {
+          activeClipId = c.id;
+          video.currentTime = c.clip_start;
+          if (video.paused) video.play();
+        }
+        renderClipList();
+        renderClipOverlays();
+        drawBackground();
+        drawForeground();
+      };
+    })(clip));
+
+    clipItems.appendChild(div);
+  });
+}
+
+function renderClipOverlays() {
+  var container = document.getElementById("clip-overlay-buttons");
+  container.innerHTML = "";
+  if (duration <= 0) return;
+  var w = tlWrap.clientWidth;
+  clips.forEach(function(clip, i) {
+    var x1 = (clip.clip_start / duration) * w;
+    var x2 = (clip.clip_end / duration) * w;
+    var midX = (x1 + x2) / 2;
+    var btn = document.createElement("button");
+    btn.textContent = clip.label || ("#" + clip.id);
+    btn.style.cssText = "position:absolute; pointer-events:auto; " +
+      "left:" + midX + "px; top:2px; transform:translateX(-50%); " +
+      "background:" + clipColor(i) + "; color:#fff; border:none; " +
+      "border-radius:8px; padding:1px 6px; font-size:9px; cursor:pointer; " +
+      "opacity:" + (clip.id === activeClipId ? "1" : "0.7") + "; z-index:10;";
+    btn.addEventListener("click", (function(c) {
+      return function(e) {
+        e.stopPropagation();
+        if (activeClipId === c.id) {
+          activeClipId = null;
+        } else {
+          activeClipId = c.id;
+          video.currentTime = c.clip_start;
+          if (video.paused) video.play();
+        }
+        renderClipList();
+        renderClipOverlays();
+        drawBackground();
+        drawForeground();
+      };
+    })(clip));
+    container.appendChild(btn);
+  });
+}
+
+// ── Receive render events from Streamlit ─────────────────
+function onRender(event) {
+  var data = event.data;
+
+  // Only handle streamlit render messages
+  if (!data || data.type !== "streamlit:render") return;
+
+  var args = data.args || {};
+
+  // Video URL
+  if (args.video_url && args.video_url !== videoUrl) {
+    videoUrl = args.video_url;
+    savedCurrentTime = video.currentTime || savedCurrentTime;
+    wasPlaying = !video.paused;
+    video.src = videoUrl;
+    console.log("[video-editor] src set to:", videoUrl);
+  }
+  if (!args.video_url) {
+    console.warn("[video-editor] no video_url in args", args);
+  }
+
+  duration = args.duration || 0;
+  fps = args.fps || 30;
+  clips = args.clips || [];
+  markers = args.markers || [];
+  activity = args.activity || [];
+  cheers = args.cheers || [];
+
+  resizeCanvases();
+  drawBackground();
+  drawForeground();
+  renderClipList();
+  renderClipOverlays();
+
+  setFrameHeight();
+}
+
+window.addEventListener("message", onRender);
+
+// Signal readiness
+setComponentReady();
+setFrameHeight();
+
+// Delete key to remove active clip
+document.addEventListener("keydown", function(e) {
+  if ((e.key === "Delete" || e.key === "Backspace") && activeClipId !== null) {
+    e.preventDefault();
+    setComponentValue({ action: "delete_clip", clip_id: activeClipId, _ts: Date.now() });
+    activeClipId = null;
+    renderClipList();
+    renderClipOverlays();
+    drawBackground();
+    drawForeground();
+  }
+});
+
+// Handle resize
+window.addEventListener("resize", function() {
+  resizeCanvases();
+  drawBackground();
+  drawForeground();
+  renderClipOverlays();
+  setFrameHeight();
+});
+</script>
+</body>
+</html>

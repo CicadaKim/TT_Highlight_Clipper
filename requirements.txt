@@ -1,0 +1,30 @@
+# Core
+opencv-python>=4.8
+numpy>=1.24
+pyyaml>=6.0
+scipy>=1.11
+
+# Audio SED
+panns-inference>=0.1.1
+librosa>=0.10
+soundfile>=0.12
+
+# OCR
+pytesseract>=0.3.10
+Pillow>=10.0
+
+# Video / subprocess
+# ffmpeg must be installed system-wide
+
+# CLI
+click>=8.1
+
+# Plotting / debug
+matplotlib>=3.7
+
+# UI
+streamlit>=1.28
+streamlit-drawable-canvas>=0.9.3
+
+# Utilities
+tqdm>=4.65

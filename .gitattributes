@@ -1,0 +1,46 @@
+# Auto detect text files and normalise line endings
+* text=auto
+
+# Python
+*.py text diff=python
+*.pyi text diff=python
+
+# Web
+*.html text diff=html
+*.css text
+*.js text
+
+# Data / config
+*.json text
+*.yaml text
+*.yml text
+*.toml text
+*.cfg text
+*.ini text
+*.txt text
+
+# Docs
+*.md text diff=markdown
+
+# Shell
+*.sh text eol=lf
+*.bash text eol=lf
+
+# Windows
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.mp4 binary
+*.wav binary
+*.mp3 binary
+*.zip binary
+*.gz binary
+*.tar binary
+*.whl binary
+*.pyc binary
