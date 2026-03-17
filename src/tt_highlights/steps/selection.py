@@ -52,6 +52,24 @@ def run(job: dict, config: dict, job_path: str) -> None:
     features_by_id = {f["rally_id"]: f for f in features_data["rally_features"]}
     candidates = scores_data["candidates"]
 
+    # Apply scoring.minimums filters
+    minimums = config.get("scoring", {}).get("minimums", {})
+    min_segment_score = minimums.get("segment_score", 0)
+    min_category_score = minimums.get("category_score", 0)
+
+    if min_segment_score > 0:
+        for cat in list(candidates.keys()):
+            candidates[cat] = [
+                c for c in candidates[cat]
+                if rallies_by_id.get(c["rally_id"], {}).get("segment_score", 1) >= min_segment_score
+            ]
+    if min_category_score > 0:
+        for cat in list(candidates.keys()):
+            candidates[cat] = [
+                c for c in candidates[cat]
+                if c["score"] >= min_category_score
+            ]
+
     # Step 1: Select candidates per category by quota
     selected = []
     used_rally_ids = set()

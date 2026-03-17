@@ -7,17 +7,19 @@
 - Status: **COMPLETE**
 
 ## Step 3: tuning artifact 저장/자동 로드
-- [x] parameter_suggestions.json artifact 도입
-- [x] feedback_labels.json artifact 도입
-- [x] app.py "Apply Suggested Parameters": session override + artifact 저장
-- [x] 세션 시작 시 기존 suggestion 표시 + "Load previous suggestions" 버튼
-- [x] "Revert suggestions" 버튼
-- [x] highlight toggle, delete(exclude) 액션을 feedback_labels.json에 기록
 - Status: **COMPLETE**
-- Verification: syntax OK, functions import OK
 
 ## Step 4: feature 정규화 + scoring 개선
-- Status: IN PROGRESS
+- [x] features.py: raw/norm 구조 + flat compat 필드 유지
+- [x] features.py: percentile clipping + 0-1 정규화
+- [x] features.py: 5개 미만 gate (identity fallback)
+- [x] features.py: binary feature (ocr_score_change) 복사
+- [x] features.py: ball_features_enabled, impact_times, ball_speed_peak_t 추가
+- [x] scoring.py: norm fallback 패턴, reasons에 raw/norm/weight/contribution
+- [x] default_config.yaml: normalization + minimums 추가
+- [x] selection.py: scoring.minimums 후보 필터링 적용
+- Status: **COMPLETE**
+- Verification: syntax OK, normalization tested (6 rallies + identity fallback)
 
 ## Step 5: selection hybrid 재구현
-- Status: NOT STARTED
+- Status: IN PROGRESS

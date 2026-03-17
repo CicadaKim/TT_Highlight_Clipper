@@ -19,6 +19,7 @@ def run(job: dict, config: dict, job_path: str) -> None:
         features_data = json.load(f)
 
     weights = config["scoring"]["weights"]
+    minimums = config.get("scoring", {}).get("minimums", {})
     rally_features = features_data["rally_features"]
 
     candidates = {}
@@ -31,16 +32,23 @@ def run(job: dict, config: dict, job_path: str) -> None:
             reasons = []
 
             for feature_name, weight in cat_weights.items():
-                value = feat.get(feature_name, 0) or 0
+                # Use normalized value if available, fallback to raw/flat
+                norm = feat.get("norm", feat)
+                raw_value = feat.get("raw", feat).get(feature_name, 0) or 0
+                value = norm.get(feature_name, 0) or 0
                 contribution = value * weight
                 score += contribution
                 if contribution > 0:
-                    reasons.append(f"{feature_name}={value:.2f}*{weight}={contribution:.2f}")
+                    reasons.append({
+                        "feature": feature_name,
+                        "raw": round(float(raw_value), 4),
+                        "norm": round(float(value), 4),
+                        "weight": weight,
+                        "contribution": round(contribution, 4),
+                    })
 
             # Sort reasons by contribution (descending)
-            reasons.sort(
-                key=lambda r: float(r.split("=")[-1]), reverse=True
-            )
+            reasons.sort(key=lambda r: r["contribution"], reverse=True)
             scored.append({
                 "rally_id": feat["rally_id"],
                 "score": round(score, 4),

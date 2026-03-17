@@ -1,4 +1,20 @@
-"""Step: features – consolidate all signals into per-rally feature vectors."""
+"""Step: features – consolidate all signals into per-rally feature vectors.
+
+Output structure per rally:
+  {
+    rally_id: int,
+    raw: { duration, impact_count, ... },
+    norm: { duration, impact_count, ... },
+    # Flat compat fields (transition period)
+    duration: ...,
+    impact_count: ...,
+    ...
+  }
+
+Normalization: percentile clipping + 0-1 scaling within the job.
+If fewer than 5 rallies, normalization is skipped (identity fallback).
+Binary features (e.g., ocr_score_change) are copied as-is to norm.
+"""
 
 import json
 import logging
@@ -10,6 +26,14 @@ import numpy as np
 from ..job import artifacts_dir
 
 logger = logging.getLogger(__name__)
+
+# Features that are binary (0/1) and should not be normalized
+_BINARY_FEATURES = {"ocr_score_change"}
+
+# Features from ball tracking that depend on quality gate
+_BALL_FEATURES = {
+    "ball_speed_peak", "ball_accel_spikes", "ball_coverage_entropy",
+}
 
 
 def run(job: dict, config: dict, job_path: str) -> None:
@@ -38,6 +62,12 @@ def run(job: dict, config: dict, job_path: str) -> None:
 
     quality_min = config["ball"]["quality_min_ratio"]
 
+    # Check if ball features are available
+    ball_features_enabled = bool(
+        ball_tracks and ball_tracks.get("enabled")
+    )
+
+    # ── Extract raw features per rally ────────────────────────────────────
     rally_features = []
     for rally in rallies:
         rid = rally["id"]
@@ -50,8 +80,10 @@ def run(job: dict, config: dict, job_path: str) -> None:
         impact_count = len(rally_impacts)
         impact_rate = impact_count / max(duration, 0.1)
         impact_peak = max((imp["score"] for imp in rally_impacts), default=0.0)
-        # Timestamp of the highest-score impact within the rally
         impact_peak_t = max(rally_impacts, key=lambda i: i["score"])["t"] if rally_impacts else (start + end) / 2
+
+        # Collect impact timestamps for selection step
+        impact_times = [imp["t"] for imp in rally_impacts]
 
         # Activity features
         activity_mean, activity_peak = _activity_stats(act_times, act_values, start, end)
@@ -73,16 +105,18 @@ def run(job: dict, config: dict, job_path: str) -> None:
         # Ball features (quality-gated)
         ball_quality = 0.0
         ball_speed_peak = 0.0
+        ball_speed_peak_t = None
         ball_accel_spikes = 0.0
         ball_coverage_entropy = 0.0
 
-        if ball_tracks and ball_tracks.get("enabled"):
+        if ball_features_enabled:
             for track in ball_tracks.get("tracks", []):
                 if track["rally_id"] == rid:
                     ball_quality = track.get("quality", 0.0)
                     if ball_quality >= quality_min:
                         pts = track.get("best_track", [])
                         ball_speed_peak = _ball_speed_peak(pts)
+                        ball_speed_peak_t = _ball_speed_peak_time(pts)
                         ball_accel_spikes = _ball_accel_spikes(pts)
                         ball_coverage_entropy = _ball_coverage_entropy(
                             pts, config["video"]["warp_width"],
@@ -90,8 +124,7 @@ def run(job: dict, config: dict, job_path: str) -> None:
                         )
                     break
 
-        feat = {
-            "rally_id": rid,
+        raw = {
             "duration": round(duration, 3),
             "impact_count": impact_count,
             "impact_rate": round(impact_rate, 4),
@@ -107,13 +140,92 @@ def run(job: dict, config: dict, job_path: str) -> None:
             "ball_accel_spikes": round(ball_accel_spikes, 4),
             "ball_coverage_entropy": round(ball_coverage_entropy, 4),
         }
+
+        feat = {
+            "rally_id": rid,
+            "raw": raw,
+            "impact_times": impact_times,
+            "ball_speed_peak_t": ball_speed_peak_t,
+            "ball_features_enabled": ball_features_enabled,
+        }
+
+        # Flat compat fields (transition period)
+        feat.update(raw)
+
         rally_features.append(feat)
+
+    # ── Normalize features ────────────────────────────────────────────────
+    norm_cfg = config.get("scoring", {}).get("normalization", {})
+    clip_low = norm_cfg.get("clip_percentile_low", 5)
+    clip_high = norm_cfg.get("clip_percentile_high", 95)
+
+    _normalize_features(rally_features, clip_low, clip_high)
 
     output = {"rally_features": rally_features}
     with open(art / "features.json", "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2)
 
     logger.info(f"Features computed for {len(rally_features)} rallies.")
+
+
+def _normalize_features(
+    rally_features: list[dict],
+    clip_low: float = 5,
+    clip_high: float = 95,
+) -> None:
+    """Add 'norm' dict with 0-1 normalized features to each rally.
+
+    - Skips normalization (identity) if fewer than 5 rallies
+    - Binary features are copied as-is
+    - Percentile clipping prevents outlier dominance
+    """
+    if not rally_features:
+        return
+
+    # Collect all numeric feature keys from raw
+    feature_keys = list(rally_features[0]["raw"].keys())
+
+    if len(rally_features) < 5:
+        # Identity fallback: norm = raw
+        for feat in rally_features:
+            feat["norm"] = dict(feat["raw"])
+        return
+
+    # Collect values per feature for percentile computation
+    feature_values: dict[str, list[float]] = {
+        k: [] for k in feature_keys
+    }
+    for feat in rally_features:
+        for k in feature_keys:
+            feature_values[k].append(float(feat["raw"].get(k, 0) or 0))
+
+    # Compute percentile bounds per feature
+    bounds: dict[str, tuple[float, float]] = {}
+    for k in feature_keys:
+        if k in _BINARY_FEATURES:
+            continue
+        vals = np.array(feature_values[k])
+        low = float(np.percentile(vals, clip_low))
+        high = float(np.percentile(vals, clip_high))
+        bounds[k] = (low, high)
+
+    # Normalize
+    for feat in rally_features:
+        norm = {}
+        for k in feature_keys:
+            raw_val = float(feat["raw"].get(k, 0) or 0)
+            if k in _BINARY_FEATURES:
+                norm[k] = raw_val
+            elif k in bounds:
+                low, high = bounds[k]
+                if high - low < 1e-9:
+                    norm[k] = 0.5 if raw_val > 0 else 0.0
+                else:
+                    clipped = max(low, min(high, raw_val))
+                    norm[k] = round((clipped - low) / (high - low), 4)
+            else:
+                norm[k] = raw_val
+        feat["norm"] = norm
 
 
 def _load_optional(path: Path) -> dict | None:
@@ -176,6 +288,25 @@ def _ball_speed_peak(pts: list[dict]) -> float:
         speed = math.sqrt(dx ** 2 + dy ** 2) / dt
         speeds.append(speed)
     return max(speeds) if speeds else 0.0
+
+
+def _ball_speed_peak_time(pts: list[dict]) -> float | None:
+    """Return the time at which peak ball speed occurs."""
+    if len(pts) < 2:
+        return None
+    best_speed = 0.0
+    best_t = None
+    for i in range(1, len(pts)):
+        dt = pts[i]["t"] - pts[i - 1]["t"]
+        if dt <= 0:
+            continue
+        dx = pts[i]["x"] - pts[i - 1]["x"]
+        dy = pts[i]["y"] - pts[i - 1]["y"]
+        speed = math.sqrt(dx ** 2 + dy ** 2) / dt
+        if speed > best_speed:
+            best_speed = speed
+            best_t = pts[i]["t"]
+    return best_t
 
 
 def _ball_accel_spikes(pts: list[dict]) -> float:

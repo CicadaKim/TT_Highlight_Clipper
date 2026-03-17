@@ -79,6 +79,12 @@ highlights:
   video_floor: 0.03
 
 scoring:
+  normalization:
+    clip_percentile_low: 5
+    clip_percentile_high: 95
+  minimums:
+    segment_score: 0.15
+    category_score: 0.1
   weights:
     long_rally:
       duration: 1.0
