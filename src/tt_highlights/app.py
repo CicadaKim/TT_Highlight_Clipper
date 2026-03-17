@@ -513,15 +513,7 @@ def _screen_clip_editor():
                     next_id = _next_clip_id()
                     for r in rallies:
                         end = r.get("end_refined", r["end"])
-                        ca = r.get("conf_audio", 0)
-                        cv_norm = r.get("conf_video_norm", 0)
-                        rhythm = r.get("rhythm_score", 0)
-                        cv_raw = r.get("conf_video", 0)
-                        vid_floor = hl_cfg.get("video_floor", 0.03)
-                        if cv_raw < vid_floor:
-                            combined = 0.0
-                        else:
-                            combined = ca * 0.3 + cv_norm * 0.5 + rhythm * 0.2
+                        combined = r.get("segment_score", 0)
                         st.session_state.clips.append({
                             "id": next_id,
                             "rally_id": r["id"],
@@ -531,9 +523,11 @@ def _screen_clip_editor():
                             "is_highlight": combined >= hl_threshold,
                             "conf_audio": r.get("conf_audio", 0),
                             "conf_video": r.get("conf_video", 0),
-                            "conf_video_norm": cv_norm,
+                            "conf_video_norm": r.get("conf_video_norm", 0),
                             "impact_count": r.get("impact_count", 0),
                             "rhythm_score": r.get("rhythm_score", 0),
+                            "segment_score": combined,
+                            "segment_flags": r.get("segment_flags", []),
                             "reason_end": r.get("reason_end_refined", ""),
                         })
                         next_id += 1
@@ -1010,9 +1004,9 @@ def _render_explanation(result) -> None:
     bd = result.score_breakdown
     formula = (
         f"`{result.combined_score:.2f}` = "
-        f"audio({bd['conf_audio']:.2f} x 0.3) + "
-        f"video({bd['conf_video_norm']:.2f} x 0.5) + "
-        f"rhythm({bd['rhythm_score']:.2f} x 0.2)"
+        f"audio({bd['conf_audio']:.2f} x 0.45) + "
+        f"video({bd['conf_video_norm']:.2f} x 0.35) + "
+        f"rhythm({bd['rhythm_score']:.2f} x 0.20)"
     )
     st.markdown(formula)
 

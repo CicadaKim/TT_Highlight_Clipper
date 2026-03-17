@@ -184,14 +184,30 @@ def run(job: dict, config: dict, job_path: str) -> None:
     for i, r in enumerate(activity_filtered):
         r["id"] = i + 1
 
-    # --- [MODIFIED] Step 11: Confidence (count + quality + rhythm weighted) ---
+    # --- [MODIFIED] Step 11: Confidence + segment_score ---
+    vid_floor = scfg.get("conf_video_floor", 0.03)
     for r in activity_filtered:
         count_factor = min(1.0, r["impact_count"] / 8.0)
         quality_factor = min(1.0, r["impact_score_mean"] / 0.3)
-        rhythm_factor = r["rhythm_score"]
         r["conf_audio"] = round(
-            count_factor * 0.35 + quality_factor * 0.35 + rhythm_factor * 0.30, 4
+            count_factor * 0.5 + quality_factor * 0.5, 4
         )
+
+        # segment_score: unified score for highlight candidacy
+        ca = r["conf_audio"]
+        cv_norm = r.get("conf_video_norm", 0)
+        rhythm = r.get("rhythm_score", 0)
+        r["segment_score"] = round(
+            ca * 0.45 + cv_norm * 0.35 + rhythm * 0.20, 4
+        )
+
+        # segment_flags for diagnosis
+        flags = []
+        if cv_norm < 0.1:
+            flags.append("low_video")
+        if r.get("conf_video", 0) >= vid_floor and cv_norm >= 0.3:
+            flags.append("video_confirmed")
+        r["segment_flags"] = flags
 
     # Remove transient fields before output
     for r in activity_filtered:

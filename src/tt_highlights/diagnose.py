@@ -235,14 +235,13 @@ def explain_detected_rally(
     if reason_end:
         reasons.append(f"end reason: {reason_end}")
 
-    # Highlight score
-    vid_floor = hl_cfg.get("video_floor", 0.03)
+    # Highlight score — uses segment_score if available, else recompute
     threshold = hl_cfg.get("auto_threshold", 0.4)
 
-    if cv_raw < vid_floor:
-        combined = 0.0
-    else:
-        combined = ca * 0.3 + cv_norm * 0.5 + rhythm * 0.2
+    combined = clip.get("segment_score", 0)
+    if combined == 0:
+        # Fallback: recompute from components using unified formula
+        combined = ca * 0.45 + cv_norm * 0.35 + rhythm * 0.20
     combined = round(combined, 4)
 
     is_hl = clip.get("is_highlight", False)
@@ -258,12 +257,17 @@ def explain_detected_rally(
 
     breakdown = {
         "conf_audio": round(ca, 4),
-        "conf_audio_weighted": round(ca * 0.3, 4),
+        "conf_audio_weighted": round(ca * 0.45, 4),
         "conf_video_norm": round(cv_norm, 4),
-        "conf_video_weighted": round(cv_norm * 0.5, 4),
+        "conf_video_weighted": round(cv_norm * 0.35, 4),
         "rhythm_score": round(rhythm, 4),
-        "rhythm_weighted": round(rhythm * 0.2, 4),
+        "rhythm_weighted": round(rhythm * 0.20, 4),
     }
+
+    # Include segment_flags in detection reasons
+    segment_flags = clip.get("segment_flags", [])
+    if segment_flags:
+        reasons.append(f"flags: {', '.join(segment_flags)}")
 
     # Suggestions for false positives (detected but user un-highlighted)
     suggestions = []
