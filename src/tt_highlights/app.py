@@ -16,6 +16,7 @@ from tt_highlights.steps import get_step_function
 from tt_highlights.media_server import start_media_server, get_media_url
 from tt_highlights.recent import add_recent_job, get_recent_jobs, remove_recent_job
 from tt_highlights.diagnose import diagnose_missed_rally, explain_detected_rally
+from tt_highlights.steps.setup import is_setup_complete
 
 logger = logging.getLogger(__name__)
 
@@ -251,9 +252,45 @@ def _screen_setup():
     if proxy_path.exists():
         st.video(str(proxy_path))
 
+    # ── ROI Setup section ─────────────────────────────────────────────────
+    st.divider()
+    st.subheader("ROI Setup")
+
+    setup_done = is_setup_complete(st.session_state.job_path)
+    if setup_done:
+        st.success("Setup complete — ROI detected.")
+        # Show current ROI info
+        roi_path = art / "table_roi.json"
+        if roi_path.exists():
+            with open(roi_path, "r") as f:
+                roi_info = json.load(f)
+            st.caption(
+                f"Table ROI: {roi_info.get('source', 'unknown')} "
+                f"(confidence: {roi_info.get('confidence', 'N/A')})"
+            )
+        overlay_path = Path(st.session_state.job_path).parent / "debug" / "frame0_overlay.png"
+        if overlay_path.exists():
+            st.image(str(overlay_path), caption="Table ROI overlay")
+
+    # Auto-detect button
+    if st.button("Run Auto-detect ROI", key="run_setup"):
+        try:
+            _run_step("setup")
+            st.success("Setup auto-detection complete!")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Setup failed: {e}")
+
+    # Canvas-based ROI editing
+    if frame0_path.exists():
+        _roi_canvas_editor(art, frame0_path)
+
     if st.button("Next: Clip Editor", type="primary"):
-        st.session_state.current_screen = "editor"
-        st.rerun()
+        if not is_setup_complete(st.session_state.job_path):
+            st.warning("Please complete ROI setup first (click 'Run Auto-detect ROI' or save manual ROI).")
+        else:
+            st.session_state.current_screen = "editor"
+            st.rerun()
 
 
 # ─── Screen 2: Clip Editor ───────────────────────────────────────────────────
@@ -450,10 +487,13 @@ def _screen_clip_editor():
         },
     }
 
-    if st.button("Auto-detect Rallies", type="secondary"):
+    # Gate: setup must be complete before auto-detect
+    if not is_setup_complete(st.session_state.job_path):
+        st.warning("ROI setup not completed. Go to Setup screen and run ROI detection first.")
+
+    if st.button("Auto-detect Rallies", type="secondary",
+                 disabled=not is_setup_complete(st.session_state.job_path)):
         try:
-            with st.spinner("Running table ROI detection..."):
-                _run_step("table_roi", config_override)
             with st.spinner("Running audio event detection..."):
                 _run_step("audio_events", config_override)
             with st.spinner("Running video activity analysis..."):
@@ -990,6 +1030,164 @@ def _render_explanation(result) -> None:
         st.markdown("**Suggestions:**")
         for s in result.suggestions:
             st.markdown(f"- {s}")
+
+
+# ─── ROI Canvas Editor ────────────────────────────────────────────────────────
+
+def _roi_canvas_editor(art: Path, frame0_path: Path) -> None:
+    """Interactive ROI editor using streamlit-drawable-canvas."""
+    from streamlit_drawable_canvas import st_canvas
+    from PIL import Image
+
+    st.markdown("**Manual ROI Editor** — click 4 points for table, draw rect for scoreboard")
+
+    with st.expander("Edit Table ROI (4-point click)", expanded=False):
+        img = Image.open(str(frame0_path))
+        img_w, img_h = img.size
+
+        # Scale to fit UI
+        canvas_w = min(800, img_w)
+        scale = canvas_w / img_w
+        canvas_h = int(img_h * scale)
+
+        canvas_result = st_canvas(
+            fill_color="rgba(255, 0, 0, 0.3)",
+            stroke_width=3,
+            stroke_color="#00FF00",
+            background_image=img,
+            drawing_mode="point",
+            point_display_radius=6,
+            width=canvas_w,
+            height=canvas_h,
+            key="table_roi_canvas",
+        )
+
+        # Show existing proposal overlay
+        roi_path = art / "table_roi.json"
+        if roi_path.exists():
+            with open(roi_path, "r") as f:
+                current_roi = json.load(f)
+            pts = current_roi.get("table_polygon", [])
+            if pts:
+                st.caption(
+                    f"Current: {pts} "
+                    f"(source={current_roi.get('source', '?')}, "
+                    f"conf={current_roi.get('confidence', '?')})"
+                )
+
+        col_u1, col_u2, col_u3 = st.columns(3)
+        with col_u1:
+            if st.button("Use Auto Proposal", key="use_auto_table"):
+                # Re-run auto-detect and save
+                try:
+                    _run_step("setup")
+                    st.success("Auto proposal applied!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Auto-detect failed: {e}")
+        with col_u2:
+            if st.button("Reset Canvas", key="reset_table_canvas"):
+                st.rerun()
+        with col_u3:
+            if st.button("Save Manual Table ROI", key="save_manual_table"):
+                if (canvas_result is not None
+                        and canvas_result.json_data is not None):
+                    objects = canvas_result.json_data.get("objects", [])
+                    points = [
+                        [int(obj["left"] / scale), int(obj["top"] / scale)]
+                        for obj in objects
+                        if obj.get("type") == "circle"
+                    ]
+                    if len(points) == 4:
+                        roi_data = {
+                            "table_polygon": points,
+                            "polygon_order": "clockwise",
+                            "source": "manual",
+                            "confidence": 1.0,
+                            "frame_id": 0,
+                            "frame_size": {"w": img_w, "h": img_h},
+                        }
+                        with open(roi_path, "w", encoding="utf-8") as f:
+                            json.dump(roi_data, f, indent=2)
+                        # Mark setup as complete
+                        _mark_setup_complete(art)
+                        st.success("Manual table ROI saved!")
+                        st.rerun()
+                    else:
+                        st.warning(f"Need exactly 4 points, got {len(points)}.")
+                else:
+                    st.warning("No points drawn on canvas.")
+
+    with st.expander("Edit Scoreboard ROI (rectangle)", expanded=False):
+        img = Image.open(str(frame0_path))
+        img_w, img_h = img.size
+        canvas_w = min(800, img_w)
+        scale = canvas_w / img_w
+        canvas_h = int(img_h * scale)
+
+        sb_canvas = st_canvas(
+            fill_color="rgba(0, 0, 255, 0.2)",
+            stroke_width=2,
+            stroke_color="#0000FF",
+            background_image=img,
+            drawing_mode="rect",
+            width=canvas_w,
+            height=canvas_h,
+            key="scoreboard_roi_canvas",
+        )
+
+        sb_path = art / "scoreboard_roi.json"
+        if sb_path.exists():
+            with open(sb_path, "r") as f:
+                sb_info = json.load(f)
+            if sb_info.get("enabled"):
+                r = sb_info["rect"]
+                st.caption(f"Current: x={r['x']}, y={r['y']}, w={r['w']}, h={r['h']}")
+            else:
+                st.caption("Scoreboard ROI: disabled")
+
+        if st.button("Save Scoreboard ROI", key="save_scoreboard"):
+            if (sb_canvas is not None
+                    and sb_canvas.json_data is not None):
+                objects = sb_canvas.json_data.get("objects", [])
+                rects = [
+                    obj for obj in objects if obj.get("type") == "rect"
+                ]
+                if rects:
+                    r = rects[-1]  # Use the last drawn rect
+                    sb_data = {
+                        "enabled": True,
+                        "rect": {
+                            "x": int(r["left"] / scale),
+                            "y": int(r["top"] / scale),
+                            "w": int(r["width"] / scale),
+                            "h": int(r["height"] / scale),
+                        },
+                        "source": "manual",
+                        "confidence": 1.0,
+                        "frame_id": 0,
+                    }
+                    with open(sb_path, "w", encoding="utf-8") as f:
+                        json.dump(sb_data, f, indent=2)
+                    st.success("Scoreboard ROI saved!")
+                    st.rerun()
+                else:
+                    st.warning("No rectangle drawn.")
+            else:
+                st.warning("No rectangle drawn.")
+
+
+def _mark_setup_complete(art: Path) -> None:
+    """Write setup_state.json marking setup as complete."""
+    from datetime import datetime, timezone
+    state = {
+        "completed": True,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "requires_review": False,
+        "warnings": [],
+    }
+    with open(art / "setup_state.json", "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────

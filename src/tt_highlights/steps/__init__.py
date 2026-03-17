@@ -3,7 +3,7 @@
 # Step execution order
 STEP_ORDER = [
     "preprocess",
-    "table_roi",
+    "setup",
     "audio_events",
     "video_activity",
     "rally_segment",
