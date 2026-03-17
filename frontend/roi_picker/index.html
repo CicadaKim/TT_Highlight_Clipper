@@ -23,7 +23,7 @@
   }
   .toolbar button:hover { background: #e8e8e8; }
   .toolbar button:disabled { opacity: .4; cursor: default; }
-  .status { font-size: 13px; color: #666; margin-left: 8px; }
+  .status { font-size: 13px; color: #888; margin-left: 8px; }
 </style>
 </head>
 <body>
@@ -38,61 +38,60 @@
 </div>
 
 <script>
-/* ── Streamlit Component Communication ───────────────────────────── */
-function sendValue(val) {
-  if (window.parent && window.parent !== window) {
-    window.parent.postMessage(
-      { type: "streamlit:setComponentValue", value: val }, "*"
-    );
-  }
+/* ── Streamlit postMessage helpers (same protocol as video_editor) ── */
+function sendMsg(type, data) {
+  window.parent.postMessage(
+    Object.assign({ isStreamlitMessage: true, type: type }, data), "*"
+  );
+}
+function setComponentReady() {
+  sendMsg("streamlit:componentReady", { apiVersion: 1 });
+}
+function setComponentValue(val) {
+  sendMsg("streamlit:setComponentValue", { value: val });
 }
 function setFrameHeight(h) {
-  if (window.parent && window.parent !== window) {
-    window.parent.postMessage(
-      { type: "streamlit:setFrameHeight", height: h }, "*"
-    );
-  }
+  h = h || document.body.scrollHeight;
+  if (h < 100) h = 400;
+  sendMsg("streamlit:setFrameHeight", { height: h });
 }
 
+/* ── State ───────────────────────────────────────────────────────── */
 const COLORS = ["#ff4b4b", "#4bff4b", "#4b8bff", "#ffff4b"];
 const MAX_PTS = 4;
 
-let points = [];       // [{x, y}] in original-image coordinates
+let points = [];
 let scale = 1;
 let imgLoaded = false;
-let initialized = false;  // true after first args received & image loaded
+let initialized = false;
 let currentSrc = "";
 
-const img = document.getElementById("img");
-const container = document.getElementById("container");
-const svg = document.getElementById("svg");
+const img      = document.getElementById("img");
+const ctr      = document.getElementById("container");
+const svg      = document.getElementById("svg");
 const statusEl = document.getElementById("status");
-const btnUndo = document.getElementById("btnUndo");
+const btnUndo  = document.getElementById("btnUndo");
 const btnReset = document.getElementById("btnReset");
 
-/* ── Draw UI (no Streamlit communication here) ───────────────────── */
+/* ── Draw (pure UI, no Streamlit side-effects) ───────────────────── */
 function draw() {
-  // Clear old markers
-  container.querySelectorAll(".point").forEach(el => el.remove());
-
+  ctr.querySelectorAll(".point").forEach(el => el.remove());
   if (!imgLoaded) return;
   scale = img.clientWidth / img.naturalWidth;
 
-  // Draw numbered point markers
   points.forEach((p, i) => {
-    const div = document.createElement("div");
-    div.className = "point";
-    div.style.left = (p.x * scale) + "px";
-    div.style.top  = (p.y * scale) + "px";
-    div.style.background = COLORS[i];
-    div.textContent = String(i);
-    container.appendChild(div);
+    const d = document.createElement("div");
+    d.className = "point";
+    d.style.left = (p.x * scale) + "px";
+    d.style.top  = (p.y * scale) + "px";
+    d.style.background = COLORS[i];
+    d.textContent = String(i);
+    ctr.appendChild(d);
   });
 
-  // Draw polygon lines
-  const dw = img.clientWidth, dh = img.clientHeight;
-  svg.setAttribute("width", dw);
-  svg.setAttribute("height", dh);
+  const w = img.clientWidth, h = img.clientHeight;
+  svg.setAttribute("width", w);
+  svg.setAttribute("height", h);
   svg.innerHTML = "";
   if (points.length >= 2) {
     let d = points.map((p, i) =>
@@ -107,18 +106,15 @@ function draw() {
     svg.appendChild(path);
   }
 
-  // Status text
-  if (points.length < MAX_PTS) {
-    statusEl.textContent = `Click point ${points.length} of ${MAX_PTS}`;
-  } else {
-    statusEl.textContent = "4 points set — Save Table ROI to apply";
-  }
+  statusEl.textContent = points.length < MAX_PTS
+    ? `Click point ${points.length} of ${MAX_PTS}`
+    : "4 points set — Save Table ROI to apply";
   btnUndo.disabled = points.length === 0;
 }
 
-/* ── Notify Streamlit only on user action ────────────────────────── */
+/* ── Emit to Streamlit (only on user action) ─────────────────────── */
 function emitPoints() {
-  sendValue({
+  setComponentValue({
     points: points.map(p => [Math.round(p.x), Math.round(p.y)]),
     complete: points.length === MAX_PTS,
   });
@@ -127,46 +123,33 @@ function emitPoints() {
 /* ── User interactions ───────────────────────────────────────────── */
 img.addEventListener("click", (e) => {
   if (points.length >= MAX_PTS) return;
-  const rect = img.getBoundingClientRect();
-  const dx = e.clientX - rect.left;
-  const dy = e.clientY - rect.top;
-  points.push({ x: dx / scale, y: dy / scale });
+  const r = img.getBoundingClientRect();
+  points.push({ x: (e.clientX - r.left) / scale, y: (e.clientY - r.top) / scale });
   draw();
   emitPoints();
 });
 
-btnUndo.addEventListener("click", () => {
-  points.pop();
-  draw();
-  emitPoints();
-});
+btnUndo.addEventListener("click", () => { points.pop(); draw(); emitPoints(); });
+btnReset.addEventListener("click", () => { points = []; draw(); emitPoints(); });
 
-btnReset.addEventListener("click", () => {
-  points = [];
-  draw();
-  emitPoints();
-});
-
-/* ── Receive args from Streamlit ─────────────────────────────────── */
+/* ── Receive render args from Streamlit ──────────────────────────── */
 window.addEventListener("message", (event) => {
   const data = event.data;
   if (!data || data.type !== "streamlit:render") return;
-
   const args = data.args || {};
 
-  // Set image source only once (avoid reload loop)
+  // Set image only once
   if (args.image_b64 && args.image_b64 !== currentSrc) {
     currentSrc = args.image_b64;
     img.src = currentSrc;
   }
 
-  // Load initial points only on the very first render
-  if (!initialized && args.initial_points) {
-    const ip = args.initial_points;
-    if (Array.isArray(ip) && ip.length > 0) {
-      points = ip.map(p => ({ x: p[0], y: p[1] }));
-    }
+  // Load initial points only on very first render
+  if (!initialized) {
     initialized = true;
+    if (args.initial_points && Array.isArray(args.initial_points) && args.initial_points.length > 0) {
+      points = args.initial_points.map(p => ({ x: p[0], y: p[1] }));
+    }
     if (imgLoaded) draw();
   }
 });
@@ -174,18 +157,13 @@ window.addEventListener("message", (event) => {
 img.addEventListener("load", () => {
   imgLoaded = true;
   draw();
-  // Set frame height once after image loads
-  setTimeout(() => setFrameHeight(document.body.scrollHeight + 10), 100);
+  setTimeout(() => setFrameHeight(), 100);
 });
 
-window.addEventListener("resize", () => {
-  if (imgLoaded) draw();
-});
+window.addEventListener("resize", () => { if (imgLoaded) draw(); });
 
-// Tell Streamlit we're ready
-if (window.parent && window.parent !== window) {
-  window.parent.postMessage({ type: "streamlit:componentReady", apiVersion: 1 }, "*");
-}
+// Ready
+setComponentReady();
 </script>
 </body>
 </html>
