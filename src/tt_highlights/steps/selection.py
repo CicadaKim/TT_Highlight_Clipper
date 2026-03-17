@@ -52,6 +52,23 @@ def run(job: dict, config: dict, job_path: str) -> None:
         excluded_ids = set(feedback.get("excluded_rally_ids", []))
         pinned_ids = set(feedback.get("pinned_rally_ids", []))
 
+    # Merge feedback_labels.json (UI-generated per-action labels)
+    labels_path = art / "feedback_labels.json"
+    if labels_path.exists():
+        with open(labels_path, "r", encoding="utf-8") as f:
+            labels_data = json.load(f)
+        for entry in labels_data.get("labels", []):
+            rid = entry.get("rally_id")
+            if rid is None:
+                continue
+            action = entry.get("action")
+            if action == "exclude" or action == "unhighlight":
+                excluded_ids.add(rid)
+                pinned_ids.discard(rid)
+            elif action == "highlight":
+                pinned_ids.add(rid)
+                excluded_ids.discard(rid)
+
     ccfg = config["clips"]
     total = ccfg["total"]
     quotas = ccfg["quotas"]

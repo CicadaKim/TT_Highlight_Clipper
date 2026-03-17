@@ -39,14 +39,19 @@ def init(input_video: str, out_dir: str):
 @cli.command()
 @click.argument("step_name")
 @click.option("--job", "job_path", required=True, help="Path to job.json.")
-def step(step_name: str, job_path: str):
+@click.option("--auto-accept-setup", is_flag=True, default=False,
+              help="Accept low-confidence setup results without review.")
+def step(step_name: str, job_path: str, auto_accept_setup: bool):
     """Run a single pipeline step."""
     try:
         job = load_job(job_path)
         config = load_config(str(job_dir(job_path) / "config.yaml"))
         step_fn = get_step_function(step_name)
         logger.info(f"Running step: {step_name}")
-        step_fn(job, config, job_path)
+        if step_name == "setup":
+            step_fn(job, config, job_path, auto_accept=auto_accept_setup)
+        else:
+            step_fn(job, config, job_path)
         logger.info(f"Step '{step_name}' completed successfully.")
     except Exception as e:
         logger.error(f"Step '{step_name}' failed: {e}", exc_info=True)
@@ -79,7 +84,7 @@ def run_all(job_path: str, skip_on_fail: bool, auto_accept_setup: bool):
                             "Running setup with auto-accept...")
                 try:
                     setup_fn = get_step_function("setup")
-                    setup_fn(job, config, job_path)
+                    setup_fn(job, config, job_path, auto_accept=True)
                     logger.info("Setup auto-completed.")
                 except Exception as e:
                     logger.error(f"Auto-setup failed: {e}", exc_info=True)
@@ -100,7 +105,10 @@ def run_all(job_path: str, skip_on_fail: bool, auto_accept_setup: bool):
         try:
             step_fn = get_step_function(step_name)
             logger.info(f"=== Running step: {step_name} ===")
-            step_fn(job, config, job_path)
+            if step_name == "setup" and auto_accept_setup:
+                step_fn(job, config, job_path, auto_accept=True)
+            else:
+                step_fn(job, config, job_path)
             logger.info(f"Step '{step_name}' completed.")
         except Exception as e:
             logger.error(f"Step '{step_name}' failed: {e}", exc_info=True)

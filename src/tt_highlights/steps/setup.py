@@ -23,8 +23,16 @@ from .table_roi import _detect_table_polygon, _draw_overlay
 logger = logging.getLogger(__name__)
 
 
-def run(job: dict, config: dict, job_path: str) -> None:
-    """Execute the setup step — auto-propose ROIs and write artifacts."""
+def run(job: dict, config: dict, job_path: str, *, auto_accept: bool = False) -> None:
+    """Execute the setup step — auto-propose ROIs and write artifacts.
+
+    Parameters
+    ----------
+    auto_accept : bool
+        When True, mark setup as completed even if confidence is low.
+        When False (default), low-confidence results leave setup incomplete
+        so the user can review in the UI.
+    """
     art = artifacts_dir(job_path)
     dbg = debug_dir(job_path)
     dbg.mkdir(parents=True, exist_ok=True)
@@ -39,32 +47,42 @@ def run(job: dict, config: dict, job_path: str) -> None:
 
     h, w = frame.shape[:2]
 
-    # ── Table polygon proposal ────────────────────────────────────────────
-    polygon, confidence, method = _auto_propose_table(frame)
-
-    roi_data = {
-        "table_polygon": polygon,
-        "polygon_order": "clockwise",
-        "source": method,
-        "confidence": round(confidence, 4),
-        "frame_id": 0,
-        "frame_size": {"w": w, "h": h},
-    }
+    # ── Table polygon proposal (skip if manual ROI exists) ────────────────
     roi_path = art / "table_roi.json"
-    with open(roi_path, "w", encoding="utf-8") as f:
-        json.dump(roi_data, f, indent=2)
+    if _is_manual_roi(roi_path):
+        logger.info("Existing manual table ROI found — skipping auto-detect.")
+        with open(roi_path, "r", encoding="utf-8") as f:
+            roi_data = json.load(f)
+        polygon = roi_data["table_polygon"]
+        confidence = roi_data.get("confidence", 1.0)
+        method = roi_data.get("source", "manual")
+    else:
+        polygon, confidence, method = _auto_propose_table(frame)
+        roi_data = {
+            "table_polygon": polygon,
+            "polygon_order": "clockwise",
+            "source": method,
+            "confidence": round(confidence, 4),
+            "frame_id": 0,
+            "frame_size": {"w": w, "h": h},
+        }
+        with open(roi_path, "w", encoding="utf-8") as f:
+            json.dump(roi_data, f, indent=2)
 
-    # ── Scoreboard ROI proposal ───────────────────────────────────────────
+    # ── Scoreboard ROI proposal (skip if manual or enabled) ───────────────
     sb_path = art / "scoreboard_roi.json"
-    sb_data = {
-        "enabled": False,
-        "rect": {"x": 0, "y": 0, "w": 0, "h": 0},
-        "source": "none",
-        "confidence": 0.0,
-        "frame_id": 0,
-    }
-    with open(sb_path, "w", encoding="utf-8") as f:
-        json.dump(sb_data, f, indent=2)
+    if _should_preserve_scoreboard(sb_path):
+        logger.info("Existing manual/enabled scoreboard ROI found — keeping.")
+    else:
+        sb_data = {
+            "enabled": False,
+            "rect": {"x": 0, "y": 0, "w": 0, "h": 0},
+            "source": "none",
+            "confidence": 0.0,
+            "frame_id": 0,
+        }
+        with open(sb_path, "w", encoding="utf-8") as f:
+            json.dump(sb_data, f, indent=2)
 
     # ── Debug overlay ─────────────────────────────────────────────────────
     _draw_overlay(frame, polygon, dbg / "frame0_overlay.png")
@@ -78,8 +96,11 @@ def run(job: dict, config: dict, job_path: str) -> None:
             "Manual review recommended."
         )
 
+    # Gate: only mark completed if confidence is high enough OR auto_accept
+    completed = (not requires_review) or auto_accept
+
     state = {
-        "completed": True,
+        "completed": completed,
         "completed_at": datetime.now(timezone.utc).isoformat(),
         "requires_review": requires_review,
         "warnings": warnings,
@@ -88,9 +109,27 @@ def run(job: dict, config: dict, job_path: str) -> None:
         json.dump(state, f, indent=2)
 
     logger.info(
-        f"Setup complete: table_roi via {method} (conf={confidence:.2f}), "
-        f"requires_review={requires_review}"
+        f"Setup done: table_roi via {method} (conf={confidence:.2f}), "
+        f"requires_review={requires_review}, completed={completed}"
     )
+
+
+def _is_manual_roi(roi_path: Path) -> bool:
+    """Return True if roi_path exists and was manually set."""
+    if not roi_path.exists():
+        return False
+    with open(roi_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data.get("source") == "manual"
+
+
+def _should_preserve_scoreboard(sb_path: Path) -> bool:
+    """Return True if scoreboard ROI exists and should not be overwritten."""
+    if not sb_path.exists():
+        return False
+    with open(sb_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data.get("source") == "manual" or data.get("enabled") is True
 
 
 def _auto_propose_table(

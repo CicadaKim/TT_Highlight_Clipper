@@ -259,26 +259,45 @@ def _screen_setup():
     st.subheader("ROI Setup")
 
     setup_done = is_setup_complete(st.session_state.job_path)
+    setup_state = _load_setup_state(art)
+
     if setup_done:
         st.success("Setup complete — ROI detected.")
-        # Show current ROI info
-        roi_path = art / "table_roi.json"
-        if roi_path.exists():
-            with open(roi_path, "r") as f:
-                roi_info = json.load(f)
-            st.caption(
-                f"Table ROI: {roi_info.get('source', 'unknown')} "
-                f"(confidence: {roi_info.get('confidence', 'N/A')})"
-            )
-        overlay_path = Path(st.session_state.job_path).parent / "debug" / "frame0_overlay.png"
-        if overlay_path.exists():
-            st.image(str(overlay_path), caption="Table ROI overlay")
+    elif setup_state and setup_state.get("requires_review"):
+        st.warning(
+            "Low confidence auto-detection — manual review recommended. "
+            "Confirm the ROI below or edit it manually."
+        )
+        for w in setup_state.get("warnings", []):
+            st.caption(w)
+        if st.button("Confirm ROI (accept as-is)", key="confirm_setup_roi", type="primary"):
+            _mark_setup_complete(art)
+            st.success("Setup confirmed!")
+            st.rerun()
+
+    # Show current ROI info
+    roi_path = art / "table_roi.json"
+    if roi_path.exists():
+        with open(roi_path, "r") as f:
+            roi_info = json.load(f)
+        st.caption(
+            f"Table ROI: {roi_info.get('source', 'unknown')} "
+            f"(confidence: {roi_info.get('confidence', 'N/A')})"
+        )
+    overlay_path = Path(st.session_state.job_path).parent / "debug" / "frame0_overlay.png"
+    if overlay_path.exists():
+        st.image(str(overlay_path), caption="Table ROI overlay")
 
     # Auto-detect button
     if st.button("Run Auto-detect ROI", key="run_setup"):
         try:
             _run_step("setup")
-            st.success("Setup auto-detection complete!")
+            # Check if review is needed after auto-detect
+            new_state = _load_setup_state(art)
+            if new_state and new_state.get("requires_review") and not new_state.get("completed"):
+                st.warning("Low confidence detection. Please review and confirm the ROI.")
+            else:
+                st.success("Setup auto-detection complete!")
             st.rerun()
         except Exception as e:
             st.error(f"Setup failed: {e}")
@@ -1255,6 +1274,15 @@ def _record_feedback_label(
 
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+
+
+def _load_setup_state(art: Path) -> dict | None:
+    """Load setup_state.json if it exists."""
+    path = art / "setup_state.json"
+    if not path.exists():
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def _mark_setup_complete(art: Path) -> None:
