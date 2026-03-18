@@ -32,3 +32,15 @@ out/
 # Misc
 *.log
 .env
+
+# Conda
+.condaenv/
+
+# Claude Code
+.claude/
+
+# Model weights
+*.pt
+
+# Stray files
+=8.1

@@ -42,8 +42,10 @@ def run(job: dict, config: dict, job_path: str) -> None:
         audio_data = audio_data.mean(axis=1)
 
     # Run PANNs SED model
-    logger.info("Running PANNs SED model...")
-    framewise_probs, labels = _run_panns_sed(audio_data, sr)
+    from ..runtime import resolve_device
+    device = resolve_device(config)
+    logger.info(f"Running PANNs SED model on {device}...")
+    framewise_probs, labels = _run_panns_sed(audio_data, sr, device=device)
 
     # Find label indices for impact, cheer, clap
     impact_indices = _find_label_indices(labels, acfg["impact_label_contains"])
@@ -128,11 +130,11 @@ def run(job: dict, config: dict, job_path: str) -> None:
                  impact_events, all_cheer_segments, dbg / "audio_events_plot.png")
 
 
-def _run_panns_sed(audio: np.ndarray, sr: int) -> tuple[np.ndarray, list[str]]:
+def _run_panns_sed(audio: np.ndarray, sr: int, device: str = "cpu") -> tuple[np.ndarray, list[str]]:
     """Run PANNs SED and return (framewise_probs, labels)."""
     from panns_inference import SoundEventDetection, labels as panns_labels
 
-    sed = SoundEventDetection(checkpoint_path=None, device="cpu")
+    sed = SoundEventDetection(checkpoint_path=None, device=device)
     # panns expects (batch, samples) at 32000 sr
     audio_input = audio[np.newaxis, :].astype(np.float32)
     framewise_output = sed.inference(audio_input)

@@ -30,9 +30,32 @@ logger = logging.getLogger(__name__)
 # Features that are binary (0/1) and should not be normalized
 _BINARY_FEATURES = {"ocr_score_change"}
 
+# Features where lower raw value = higher quality (inverted normalization)
+_INVERSE_FEATURES = {"stance_variability_near", "stance_variability_far"}
+
 # Features from ball tracking that depend on quality gate
 _BALL_FEATURES = {
     "ball_speed_peak", "ball_accel_spikes", "ball_coverage_entropy",
+}
+
+# Features from player motion (opt-in)
+_MOTION_FEATURES = {
+    "motion_asymmetry", "end_burst_asymmetry",
+    "near_motion_mean", "far_motion_mean",
+    "near_end_burst", "far_end_burst",
+}
+
+# Features from pose estimation (opt-in)
+_POSE_FEATURES = {
+    "pose_asymmetry", "swing_count_diff",
+    "wrist_speed_peak_near", "wrist_speed_peak_far",
+    "wrist_speed_mean_near", "wrist_speed_mean_far",
+    "arm_extension_peak_near", "arm_extension_peak_far",
+    "pose_confidence_near", "pose_confidence_far",
+    "pose_energy_near", "pose_energy_far",
+    "stance_variability_near", "stance_variability_far",
+    # Aggregate keys (used by scoring config)
+    "wrist_speed_peak", "wrist_speed_mean", "arm_extension_peak",
 }
 
 
@@ -51,6 +74,8 @@ def run(job: dict, config: dict, job_path: str) -> None:
     # Load optional inputs
     ocr_events = _load_optional(art / "ocr_events.json")
     ball_tracks = _load_optional(art / "ball_tracks.json")
+    player_motion = _load_optional(art / "player_motion.json")
+    pose_data = _load_optional(art / "pose_estimation.json")
 
     rallies = rallies_data["rallies"]
     impacts = audio_events["impact_events"]
@@ -66,6 +91,27 @@ def run(job: dict, config: dict, job_path: str) -> None:
     ball_features_enabled = bool(
         ball_tracks and ball_tracks.get("enabled")
     )
+
+    # Check if player motion features are available
+    motion_enabled = bool(
+        player_motion and player_motion.get("enabled")
+    )
+    motion_by_rally = {}
+    if motion_enabled:
+        for mr in player_motion.get("rallies", []):
+            motion_by_rally[mr["rally_id"]] = mr
+
+    # Full-video samples fallback for ball/motion
+    ball_samples = ball_tracks.get("samples", []) if ball_tracks else []
+    motion_samples = player_motion.get("samples", []) if player_motion else []
+    motion_zone_labels = player_motion.get("zone_labels", []) if player_motion else []
+
+    # Check if pose estimation features are available
+    pose_enabled = bool(pose_data and pose_data.get("enabled"))
+    pose_by_rally = {}
+    if pose_enabled:
+        for pr in pose_data.get("rallies", []):
+            pose_by_rally[pr["rally_id"]] = pr
 
     # ── Extract raw features per rally ────────────────────────────────────
     rally_features = []
@@ -110,6 +156,8 @@ def run(job: dict, config: dict, job_path: str) -> None:
         ball_coverage_entropy = 0.0
 
         if ball_features_enabled:
+            # Try per-rally tracks first (backward compat)
+            track_found = False
             for track in ball_tracks.get("tracks", []):
                 if track["rally_id"] == rid:
                     ball_quality = track.get("quality", 0.0)
@@ -122,7 +170,116 @@ def run(job: dict, config: dict, job_path: str) -> None:
                             pts, config["video"]["warp_width"],
                             config["video"]["warp_height"]
                         )
+                    track_found = True
                     break
+
+            # Fallback: slice from full-video samples
+            if not track_found and ball_samples:
+                rally_ball = [
+                    s for s in ball_samples
+                    if start <= s["t"] <= end and s.get("detected")
+                ]
+                total_in_window = sum(
+                    1 for s in ball_samples if start <= s["t"] <= end
+                )
+                ball_quality = len(rally_ball) / max(total_in_window, 1)
+                if ball_quality >= quality_min:
+                    ball_speed_peak = _ball_speed_peak(rally_ball)
+                    ball_speed_peak_t = _ball_speed_peak_time(rally_ball)
+                    ball_accel_spikes = _ball_accel_spikes(rally_ball)
+                    ball_coverage_entropy = _ball_coverage_entropy(
+                        rally_ball, config["video"]["warp_width"],
+                        config["video"]["warp_height"]
+                    )
+
+        # Player motion features
+        motion_asymmetry = 0.0
+        end_burst_asymmetry = 0.0
+        near_motion_mean = 0.0
+        far_motion_mean = 0.0
+        near_end_burst = 0.0
+        far_end_burst = 0.0
+
+        if motion_enabled and rid in motion_by_rally:
+            # Use per-rally summaries (backward compat)
+            mr = motion_by_rally[rid]
+            motion_asymmetry = mr.get("motion_asymmetry", 0.0)
+            end_burst_asymmetry = mr.get("end_burst_asymmetry", 0.0)
+            zones = mr.get("zones", {})
+            if "near" in zones:
+                near_motion_mean = zones["near"].get("raw_mean", 0.0)
+                near_end_burst = zones["near"].get("raw_end_burst", 0.0)
+            if "far" in zones:
+                far_motion_mean = zones["far"].get("raw_mean", 0.0)
+                far_end_burst = zones["far"].get("raw_end_burst", 0.0)
+        elif motion_enabled and motion_samples and motion_zone_labels:
+            # Fallback: slice from full-video samples
+            rally_ms = [
+                s for s in motion_samples if start <= s["t"] <= end
+            ]
+            if rally_ms:
+                zone_means = {}
+                for zl in motion_zone_labels:
+                    vals = [s.get(zl, 0.0) for s in rally_ms]
+                    zone_means[zl] = float(np.mean(vals)) if vals else 0.0
+                if "near" in zone_means:
+                    near_motion_mean = zone_means["near"]
+                if "far" in zone_means:
+                    far_motion_mean = zone_means["far"]
+                # End burst: last 20% of samples
+                n = len(rally_ms)
+                tail_start = max(0, n - max(1, n // 5))
+                tail = rally_ms[tail_start:]
+                if "near" in zone_means and tail:
+                    near_end_burst = float(np.mean([s.get("near", 0.0) for s in tail]))
+                if "far" in zone_means and tail:
+                    far_end_burst = float(np.mean([s.get("far", 0.0) for s in tail]))
+                # Asymmetry
+                if len(motion_zone_labels) == 2:
+                    m1 = zone_means.get(motion_zone_labels[0], 0.0)
+                    m2 = zone_means.get(motion_zone_labels[1], 0.0)
+                    denom = max(m1 + m2, 1e-6)
+                    motion_asymmetry = abs(m1 - m2) / denom
+                    eb1 = near_end_burst if motion_zone_labels[0] == "near" else far_end_burst
+                    eb2 = far_end_burst if motion_zone_labels[0] == "near" else near_end_burst
+                    eb_denom = max(eb1 + eb2, 1e-6)
+                    end_burst_asymmetry = abs(eb1 - eb2) / eb_denom
+
+        # Pose estimation features (per-zone raw values)
+        pose_asymmetry = 0.0
+        swing_count_diff = 0.0
+        wrist_speed_peak_near = 0.0
+        wrist_speed_peak_far = 0.0
+        wrist_speed_mean_near = 0.0
+        wrist_speed_mean_far = 0.0
+        arm_extension_peak_near = 0.0
+        arm_extension_peak_far = 0.0
+        pose_confidence_near = 0.0
+        pose_confidence_far = 0.0
+        pose_energy_near = 0.0
+        pose_energy_far = 0.0
+        stance_variability_near = 0.0
+        stance_variability_far = 0.0
+
+        if pose_enabled and rid in pose_by_rally:
+            pr = pose_by_rally[rid]
+            pose_asymmetry = pr.get("pose_asymmetry", 0.0)
+            swing_count_diff = pr.get("swing_count_diff", 0.0)
+            pzones = pr.get("zones", {})
+            if "near" in pzones:
+                wrist_speed_peak_near = pzones["near"].get("wrist_speed_peak", 0.0)
+                wrist_speed_mean_near = pzones["near"].get("wrist_speed_mean", 0.0)
+                arm_extension_peak_near = pzones["near"].get("arm_extension_peak", 0.0)
+                pose_confidence_near = pzones["near"].get("pose_confidence", 0.0)
+                pose_energy_near = pzones["near"].get("pose_energy", 0.0)
+                stance_variability_near = pzones["near"].get("stance_variability", 0.0)
+            if "far" in pzones:
+                wrist_speed_peak_far = pzones["far"].get("wrist_speed_peak", 0.0)
+                wrist_speed_mean_far = pzones["far"].get("wrist_speed_mean", 0.0)
+                arm_extension_peak_far = pzones["far"].get("arm_extension_peak", 0.0)
+                pose_confidence_far = pzones["far"].get("pose_confidence", 0.0)
+                pose_energy_far = pzones["far"].get("pose_energy", 0.0)
+                stance_variability_far = pzones["far"].get("stance_variability", 0.0)
 
         raw = {
             "duration": round(duration, 3),
@@ -139,6 +296,30 @@ def run(job: dict, config: dict, job_path: str) -> None:
             "ball_speed_peak": round(ball_speed_peak, 4),
             "ball_accel_spikes": round(ball_accel_spikes, 4),
             "ball_coverage_entropy": round(ball_coverage_entropy, 4),
+            "motion_asymmetry": round(motion_asymmetry, 4),
+            "end_burst_asymmetry": round(end_burst_asymmetry, 4),
+            "near_motion_mean": round(near_motion_mean, 4),
+            "far_motion_mean": round(far_motion_mean, 4),
+            "near_end_burst": round(near_end_burst, 4),
+            "far_end_burst": round(far_end_burst, 4),
+            "wrist_speed_peak_near": round(wrist_speed_peak_near, 4),
+            "wrist_speed_peak_far": round(wrist_speed_peak_far, 4),
+            "wrist_speed_mean_near": round(wrist_speed_mean_near, 4),
+            "wrist_speed_mean_far": round(wrist_speed_mean_far, 4),
+            "arm_extension_peak_near": round(arm_extension_peak_near, 4),
+            "arm_extension_peak_far": round(arm_extension_peak_far, 4),
+            "pose_confidence_near": round(pose_confidence_near, 4),
+            "pose_confidence_far": round(pose_confidence_far, 4),
+            "pose_energy_near": round(pose_energy_near, 4),
+            "pose_energy_far": round(pose_energy_far, 4),
+            "stance_variability_near": round(stance_variability_near, 4),
+            "stance_variability_far": round(stance_variability_far, 4),
+            "pose_asymmetry": round(pose_asymmetry, 4),
+            "swing_count_diff": round(swing_count_diff, 4),
+            # Scoring-aggregate features (max/mean across zones)
+            "wrist_speed_peak": round(max(wrist_speed_peak_near, wrist_speed_peak_far), 4),
+            "wrist_speed_mean": round((wrist_speed_mean_near + wrist_speed_mean_far) / 2, 4),
+            "arm_extension_peak": round(max(arm_extension_peak_near, arm_extension_peak_far), 4),
         }
 
         feat = {
@@ -219,10 +400,16 @@ def _normalize_features(
             elif k in bounds:
                 low, high = bounds[k]
                 if high - low < 1e-9:
-                    norm[k] = 0.5 if raw_val > 0 else 0.0
+                    if k in _INVERSE_FEATURES:
+                        norm[k] = 0.5 if raw_val > 0 else 1.0
+                    else:
+                        norm[k] = 0.5 if raw_val > 0 else 0.0
                 else:
                     clipped = max(low, min(high, raw_val))
-                    norm[k] = round((clipped - low) / (high - low), 4)
+                    if k in _INVERSE_FEATURES:
+                        norm[k] = round(1.0 - (clipped - low) / (high - low), 4)
+                    else:
+                        norm[k] = round((clipped - low) / (high - low), 4)
             else:
                 norm[k] = raw_val
         feat["norm"] = norm

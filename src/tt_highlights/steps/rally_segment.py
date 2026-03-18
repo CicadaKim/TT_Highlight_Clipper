@@ -1,4 +1,4 @@
-"""Step: rally_segment – combine audio events + activity to identify rally periods."""
+"""Step: rally_segment – combine audio events + activity + ball/motion to identify rally periods."""
 
 import json
 import logging
@@ -22,6 +22,10 @@ def run(job: dict, config: dict, job_path: str) -> None:
         audio_events = json.load(f)
     with open(art / "activity.json", "r", encoding="utf-8") as f:
         activity_data = json.load(f)
+
+    # Optional: ball tracking and player motion time-series
+    ball_data = _load_optional(art / "ball_tracks.json")
+    motion_data = _load_optional(art / "player_motion.json")
 
     scfg = config["segmentation"]
     impact_gap_max = scfg["impact_gap_max_sec"]
@@ -186,6 +190,36 @@ def run(job: dict, config: dict, job_path: str) -> None:
 
     # --- [MODIFIED] Step 11: Confidence + segment_score ---
     vid_floor = scfg.get("conf_video_floor", 0.03)
+
+    # Ball / motion signal weights (0 when data unavailable)
+    w_ball = scfg.get("ball_conf_weight", 0.15)
+    w_motion = scfg.get("motion_conf_weight", 0.10)
+    ball_window = scfg.get("ball_conf_window_sec", 0.5)
+    motion_threshold = scfg.get("motion_conf_threshold", 2.0)
+
+    has_ball = bool(ball_data and ball_data.get("enabled") and ball_data.get("samples"))
+    has_motion = bool(motion_data and motion_data.get("enabled") and motion_data.get("samples"))
+
+    # Pre-build ball/motion numpy arrays for fast lookup
+    if has_ball:
+        ball_samples = ball_data["samples"]
+        ball_times = np.array([s["t"] for s in ball_samples])
+        ball_detected = np.array([1.0 if s.get("detected") else 0.0 for s in ball_samples])
+    if has_motion:
+        motion_samples = motion_data["samples"]
+        motion_times = np.array([s["t"] for s in motion_samples])
+        motion_labels = [k for k in motion_samples[0].keys() if k != "t"] if motion_samples else []
+
+    # Compute dynamic weights: if ball/motion unavailable, redistribute
+    if has_ball and has_motion:
+        wa, wv, wr, wb, wm = 0.35, 0.25, 0.15, w_ball, w_motion
+    elif has_ball:
+        wa, wv, wr, wb, wm = 0.38, 0.30, 0.17, w_ball, 0.0
+    elif has_motion:
+        wa, wv, wr, wb, wm = 0.38, 0.30, 0.17, 0.0, w_motion + 0.05
+    else:
+        wa, wv, wr, wb, wm = 0.45, 0.35, 0.20, 0.0, 0.0
+
     for r in activity_filtered:
         count_factor = min(1.0, r["impact_count"] / 8.0)
         quality_factor = min(1.0, r["impact_score_mean"] / 0.3)
@@ -193,12 +227,30 @@ def run(job: dict, config: dict, job_path: str) -> None:
             count_factor * 0.5 + quality_factor * 0.5, 4
         )
 
+        # Ball visibility confidence in rally window
+        ball_conf = 0.0
+        if has_ball:
+            ball_conf = _ball_conf_in_window(
+                ball_times, ball_detected, r["start"], r["end"], ball_window,
+            )
+        r["ball_conf"] = round(ball_conf, 4)
+
+        # Motion confidence in rally window
+        motion_conf = 0.0
+        if has_motion:
+            motion_conf = _motion_conf_in_window(
+                motion_times, motion_samples, motion_labels,
+                r["start"], r["end"], motion_threshold,
+            )
+        r["motion_conf"] = round(motion_conf, 4)
+
         # segment_score: unified score for highlight candidacy
         ca = r["conf_audio"]
         cv_norm = r.get("conf_video_norm", 0)
         rhythm = r.get("rhythm_score", 0)
         r["segment_score"] = round(
-            ca * 0.45 + cv_norm * 0.35 + rhythm * 0.20, 4
+            ca * wa + cv_norm * wv + rhythm * wr
+            + ball_conf * wb + motion_conf * wm, 4
         )
 
         # segment_flags for diagnosis
@@ -207,6 +259,12 @@ def run(job: dict, config: dict, job_path: str) -> None:
             flags.append("low_video")
         if r.get("conf_video", 0) >= vid_floor and cv_norm >= 0.3:
             flags.append("video_confirmed")
+        if has_ball and ball_conf > 0.3:
+            flags.append("ball_confirmed")
+        if has_ball and ball_conf < 0.05:
+            flags.append("no_ball")
+        if has_motion and motion_conf > 0.5:
+            flags.append("motion_confirmed")
         r["segment_flags"] = flags
 
     # Remove transient fields before output
@@ -418,6 +476,70 @@ def _try_split(
         + _try_split(right, act_times, act_values, end_grace,
                      min_dur, act_max, min_window)
     )
+
+
+def _load_optional(path: Path) -> dict | None:
+    """Load a JSON file if it exists, else return None."""
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+
+def _ball_conf_in_window(
+    ball_times: np.ndarray,
+    ball_detected: np.ndarray,
+    start: float,
+    end: float,
+    window: float,
+) -> float:
+    """Compute ball visibility confidence for a rally window.
+
+    Returns ratio of frames with ball detected in [start-window, end+window].
+    """
+    mask = (ball_times >= start - window) & (ball_times <= end + window)
+    if not mask.any():
+        return 0.0
+    return float(ball_detected[mask].mean())
+
+
+def _motion_conf_in_window(
+    motion_times: np.ndarray,
+    motion_samples: list[dict],
+    motion_labels: list[str],
+    start: float,
+    end: float,
+    threshold: float,
+) -> float:
+    """Compute player motion confidence for a rally window.
+
+    Returns normalized score based on mean zone activity.
+    If both zones have activity > threshold, confidence is higher.
+    """
+    mask = (motion_times >= start) & (motion_times <= end)
+    indices = np.where(mask)[0]
+    if len(indices) == 0:
+        return 0.0
+
+    zone_means = []
+    for label in motion_labels:
+        vals = [motion_samples[i].get(label, 0.0) for i in indices]
+        zone_means.append(float(np.mean(vals)) if vals else 0.0)
+
+    if not zone_means:
+        return 0.0
+
+    # Both zones active → high confidence; single zone → partial
+    max_activity = max(zone_means)
+    min_activity = min(zone_means) if len(zone_means) > 1 else max_activity
+
+    # Normalize: threshold = expected minimum for real play
+    conf = min(1.0, max_activity / max(threshold, 1e-6))
+    # Bonus for both zones being active (bilateral motion)
+    if len(zone_means) > 1 and min_activity > threshold * 0.3:
+        conf = min(1.0, conf * 1.2)
+
+    return conf
 
 
 def _get_activity_mean(times: np.ndarray, values: np.ndarray,

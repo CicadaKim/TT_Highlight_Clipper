@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 from ..job import artifacts_dir, exports_dir
+from ..runtime import get_video_encoder
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,7 @@ def run(job: dict, config: dict, job_path: str) -> None:
 
     export_cfg = config.get("export", {})
     export_format = export_cfg.get("export_format", "both")  # "both", "video", "gif"
+    venc_args = get_video_encoder(config)
 
     # Extract individual clips (video)
     exported_clips = []
@@ -57,9 +59,7 @@ def run(job: dict, config: dict, job_path: str) -> None:
                     "-ss", str(clip_start),
                     "-i", input_video,
                     "-t", str(clip_duration),
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-                    "-pix_fmt", "yuv420p",
-                    "-profile:v", "high", "-level", "4.1",
+                    *venc_args,
                     "-c:a", "aac", "-b:a", "192k",
                     "-movflags", "+faststart",
                     str(clip_path),
@@ -112,9 +112,7 @@ def run(job: dict, config: dict, job_path: str) -> None:
             "ffmpeg", "-y",
             "-f", "concat", "-safe", "0",
             "-i", str(concat_list),
-            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-            "-pix_fmt", "yuv420p",
-            "-profile:v", "high", "-level", "4.1",
+            *venc_args,
             "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart",
             str(reel_path),

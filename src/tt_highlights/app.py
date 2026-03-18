@@ -538,17 +538,21 @@ def _screen_clip_editor():
     if not is_setup_complete(st.session_state.job_path):
         st.warning("ROI setup not completed. Go to Setup screen and run ROI detection first.")
 
-    if st.button("Auto-detect Rallies", type="secondary",
+    if st.button("Detect & Analyze", type="secondary",
                  disabled=not is_setup_complete(st.session_state.job_path)):
         try:
-            with st.spinner("Running audio event detection..."):
-                _run_step("audio_events", config_override)
-            with st.spinner("Running video activity analysis..."):
-                _run_step("video_activity", config_override)
-            with st.spinner("Running rally segmentation..."):
-                _run_step("rally_segment", config_override)
+            pipeline = [
+                "audio_events", "video_activity",
+                "ball_tracking", "player_motion",
+                "rally_segment",
+                "pose_estimation", "scoreboard_ocr",
+                "features", "scoring",
+            ]
+            for step_name in pipeline:
+                override = _filter_override_for_step(config_override, step_name) or None
+                _run_step(step_name, override)
 
-            # Immediately add detected rallies to clips
+            # Add detected rallies to clips
             rallies_path = art / "rallies.json"
             if rallies_path.exists():
                 with open(rallies_path, "r") as f:
@@ -581,12 +585,12 @@ def _screen_clip_editor():
                     _save_clips(
                         st.session_state.job_path, st.session_state.clips,
                     )
-                    st.success(f"Auto-detect complete! {len(rallies)} rallies added.")
+                    st.success(f"Detect & Analyze complete! {len(rallies)} rallies found.")
                 else:
-                    st.info("Auto-detect complete but no rallies detected.")
+                    st.info("Detect & Analyze complete but no rallies detected.")
             st.rerun()
         except Exception as e:
-            st.error(f"Auto-detect failed: {e}")
+            st.error(f"Detect & Analyze failed: {e}")
 
     # ── Load activity curve & cheer segments ──────────────────────────────
     activity_samples = []
@@ -622,6 +626,27 @@ def _screen_clip_editor():
                 if (c.get("conf_audio", 1) + c.get("conf_video", 1)) / 2 >= min_conf
                 or c.get("conf_audio") is None
             ]
+
+    # ── Rally Selector ────────────────────────────────────────────────────
+    selected_rally_id = None
+    rally_clips = [c for c in st.session_state.clips if c.get("rally_id") is not None]
+    rally_map = {c["rally_id"]: c for c in rally_clips}
+    rally_ids = sorted(rally_map.keys())
+    if rally_ids:
+        options = ["\u2014 Overview \u2014"] + [
+            f"Rally {rid} [{rally_map[rid]['clip_start']:.1f}s \u2013 {rally_map[rid]['clip_end']:.1f}s]"
+            for rid in rally_ids
+        ]
+        sel = st.selectbox("Inspect Rally", options, key="_rally_selector")
+        if sel != "\u2014 Overview \u2014":
+            selected_rally_id = rally_ids[options.index(sel) - 1]
+
+    # ── Debug Panel / Inspector / Calibration ─────────────────────────────
+    if selected_rally_id is not None:
+        try:
+            _render_inspector_panels(selected_rally_id, art)
+        except Exception as e:
+            st.error(f"Inspector error: {e}")
 
     # ── Interactive Video Editor component ────────────────────────────────
     component_value = _video_editor_component(
@@ -1113,7 +1138,7 @@ def _roi_canvas_editor(art: Path, frame0_path: Path) -> None:
     img_w, img_h = img.size
 
     with st.expander("Edit Table ROI (4-point click)", expanded=True):
-        st.caption("이미지에서 테이블 꼭짓점 4개를 시계방향(좌상→우상→우하→좌하)으로 클릭하세요")
+        st.caption("이미지에서 테이블 꼭짓점 4개를 클릭하세요 (순서 무관, 자동 정렬됩니다)")
 
         # ROI picker component
         picker_value = _roi_picker_component(
@@ -1150,6 +1175,9 @@ def _roi_canvas_editor(art: Path, frame0_path: Path) -> None:
                 points = current_pts
 
             if points and len(points) == 4:
+                from tt_highlights.steps.table_roi import _order_points_clockwise
+                points = _order_points_clockwise(points)
+                points = [[int(p[0]), int(p[1])] for p in points]
                 roi_data = {
                     "table_polygon": points,
                     "polygon_order": "clockwise",
@@ -1167,42 +1195,68 @@ def _roi_canvas_editor(art: Path, frame0_path: Path) -> None:
             else:
                 st.warning("4개 점을 모두 클릭한 뒤 저장하세요.")
 
-    with st.expander("Edit Scoreboard ROI (rectangle)", expanded=False):
-        current_sb = {"x": 0, "y": 0, "w": 0, "h": 0}
+    with st.expander("Edit Scoreboard ROI (4-point click)", expanded=False):
+        current_sb_pts = []
         sb_enabled = False
         if sb_path.exists():
             with open(sb_path, "r") as f:
                 sb_info = json.load(f)
             if sb_info.get("enabled"):
-                current_sb = sb_info.get("rect", current_sb)
                 sb_enabled = True
+                # Load polygon points if available, else derive from rect
+                if sb_info.get("polygon"):
+                    current_sb_pts = sb_info["polygon"]
+                else:
+                    r = sb_info.get("rect", {})
+                    if r.get("w", 0) > 0 and r.get("h", 0) > 0:
+                        x, y, w, h = r["x"], r["y"], r["w"], r["h"]
+                        current_sb_pts = [
+                            [x, y], [x + w, y], [x + w, y + h], [x, y + h],
+                        ]
 
         sb_enable = st.checkbox("Enable scoreboard ROI", value=sb_enabled, key="sb_enable")
 
         if sb_enable:
-            col_sx, col_sy = st.columns(2)
-            with col_sx:
-                sb_x = st.number_input("X", 0, img_w, value=current_sb["x"], key="sb_x")
-                sb_w = st.number_input("Width", 0, img_w, value=current_sb["w"], key="sb_w")
-            with col_sy:
-                sb_y = st.number_input("Y", 0, img_h, value=current_sb["y"], key="sb_y")
-                sb_h = st.number_input("Height", 0, img_h, value=current_sb["h"], key="sb_h")
+            sb_picker = _roi_picker_component(
+                image_b64=img_b64,
+                initial_points=current_sb_pts,
+                max_points=4,
+                key="sb_roi_picker",
+                height=int(img_h * min(800, img_w) / img_w) + 60,
+            )
 
-            if st.button("Save Scoreboard ROI", key="save_scoreboard"):
-                sb_data = {
-                    "enabled": True,
-                    "rect": {"x": sb_x, "y": sb_y, "w": sb_w, "h": sb_h},
-                    "source": "manual",
-                    "confidence": 1.0,
-                    "frame_id": 0,
-                }
-                with open(sb_path, "w", encoding="utf-8") as f:
-                    json.dump(sb_data, f, indent=2)
-                st.success("Scoreboard ROI saved!")
-                st.rerun()
+            if st.button("Save Scoreboard ROI", key="save_scoreboard", type="primary"):
+                pts = None
+                if (sb_picker and isinstance(sb_picker, dict)
+                        and sb_picker.get("complete")):
+                    pts = sb_picker["points"]
+                elif current_sb_pts and len(current_sb_pts) == 4:
+                    pts = current_sb_pts
+
+                if pts and len(pts) == 4:
+                    x_min = min(p[0] for p in pts)
+                    y_min = min(p[1] for p in pts)
+                    x_max = max(p[0] for p in pts)
+                    y_max = max(p[1] for p in pts)
+                    sb_data = {
+                        "enabled": True,
+                        "polygon": pts,
+                        "rect": {
+                            "x": x_min, "y": y_min,
+                            "w": x_max - x_min, "h": y_max - y_min,
+                        },
+                        "source": "manual",
+                        "confidence": 1.0,
+                        "frame_id": 0,
+                    }
+                    with open(sb_path, "w", encoding="utf-8") as f:
+                        json.dump(sb_data, f, indent=2)
+                    st.success("Scoreboard ROI saved!")
+                    st.rerun()
+                else:
+                    st.warning("4개 점을 모두 클릭한 뒤 저장하세요.")
         else:
             if sb_enabled:
-                # Was enabled, now disabled
                 if st.button("Disable Scoreboard ROI", key="disable_scoreboard"):
                     sb_data = {
                         "enabled": False,
@@ -1215,6 +1269,184 @@ def _roi_canvas_editor(art: Path, frame0_path: Path) -> None:
                         json.dump(sb_data, f, indent=2)
                     st.success("Scoreboard ROI disabled.")
                     st.rerun()
+
+    # ── Player Zone Editor ────────────────────────────────────────────────────
+    _player_zone_editor(art, frame0_path, img_w, img_h)
+
+
+def _player_zone_editor(
+    art: Path, frame0_path: Path, img_w: int, img_h: int,
+) -> None:
+    """Player zone manual editor — auto-derive or number-input edit."""
+    import cv2
+
+    pz_path = art / "player_zones.json"
+    roi_path = art / "table_roi.json"
+
+    # Load current zones
+    current_zones = []
+    pz_source = "none"
+    if pz_path.exists():
+        with open(pz_path, "r", encoding="utf-8") as f:
+            pz_data = json.load(f)
+        current_zones = pz_data.get("zones", [])
+        pz_source = pz_data.get("source", "none")
+
+    with st.expander("Edit Player Zones", expanded=False):
+        pz_enable = st.checkbox(
+            "Enable player zones",
+            value=len(current_zones) > 0,
+            key="pz_enable",
+        )
+
+        if not pz_enable:
+            if current_zones:
+                if st.button("Clear Player Zones", key="clear_pz"):
+                    if pz_path.exists():
+                        pz_path.unlink()
+                    st.success("Player zones cleared.")
+                    st.rerun()
+            return
+
+        # Auto-derive button
+        if st.button("Auto-derive from Table ROI", key="auto_derive_pz"):
+            if roi_path.exists():
+                with open(roi_path, "r", encoding="utf-8") as f:
+                    roi_data = json.load(f)
+                polygon = roi_data.get("table_polygon", [])
+                if polygon and len(polygon) == 4:
+                    from tt_highlights.steps.setup import _auto_derive_zones
+                    cfg = load_config(st.session_state.job_path)
+                    pz_cfg = cfg.get("player_zones", {})
+                    zones = _auto_derive_zones(polygon, img_h, img_w, pz_cfg)
+                    pz_out = {
+                        "source": "auto",
+                        "zones": zones,
+                        "player_a_score_side": "left",
+                        "frame_size": {"w": img_w, "h": img_h},
+                    }
+                    with open(pz_path, "w", encoding="utf-8") as f:
+                        json.dump(pz_out, f, indent=2)
+                    st.success("Player zones auto-derived!")
+                    st.rerun()
+                else:
+                    st.warning("Table ROI에 4개 점이 필요합니다. 먼저 Table ROI를 설정하세요.")
+            else:
+                st.warning("Table ROI가 없습니다. 먼저 Table ROI를 설정하세요.")
+
+        st.caption(f"Source: {pz_source}")
+
+        # Load current polygon points per zone
+        zone_map = {z["label"]: z for z in current_zones}
+
+        # Prepare image for pickers
+        import base64
+        with open(frame0_path, "rb") as fimg:
+            img_b64 = "data:image/jpeg;base64," + base64.b64encode(fimg.read()).decode()
+        # Use generous height; component's setFrameHeight will adjust
+        picker_h = max(int(img_h * 800 / max(img_w, 1)) + 80, 500)
+
+        # ── Near zone picker ──
+        st.markdown("**Near zone** (카메라 쪽 선수) — 4점 클릭")
+        near_zone = zone_map.get("near", {})
+        near_init = near_zone.get("polygon", [])
+        near_picker = _roi_picker_component(
+            image_b64=img_b64,
+            initial_points=near_init,
+            max_points=4,
+            key="pz_near_picker",
+            height=picker_h,
+        )
+
+        # ── Far zone picker ──
+        st.markdown("**Far zone** (반대편 선수) — 4점 클릭")
+        far_zone = zone_map.get("far", {})
+        far_init = far_zone.get("polygon", [])
+        far_picker = _roi_picker_component(
+            image_b64=img_b64,
+            initial_points=far_init,
+            max_points=4,
+            key="pz_far_picker",
+            height=picker_h,
+        )
+
+        if st.button("Save Player Zones", key="save_pz", type="primary"):
+            from tt_highlights.steps.table_roi import _order_points_clockwise
+
+            def _build_zone(label, picker_val, init_pts):
+                pts = None
+                if (picker_val and isinstance(picker_val, dict)
+                        and picker_val.get("complete")):
+                    pts = picker_val["points"]
+                elif init_pts and len(init_pts) == 4:
+                    pts = init_pts
+                if not pts or len(pts) != 4:
+                    return None
+                pts = _order_points_clockwise(pts)
+                pts = [[int(p[0]), int(p[1])] for p in pts]
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                return {
+                    "label": label,
+                    "polygon": pts,
+                    "rect": {
+                        "x": min(xs), "y": min(ys),
+                        "w": max(xs) - min(xs), "h": max(ys) - min(ys),
+                    },
+                    "edge_pts": [],
+                }
+
+            near_out = _build_zone("near", near_picker, near_init)
+            far_out = _build_zone("far", far_picker, far_init)
+
+            if near_out and far_out:
+                pz_out = {
+                    "source": "manual",
+                    "zones": [near_out, far_out],
+                    "player_a_score_side": "left",
+                    "frame_size": {"w": img_w, "h": img_h},
+                }
+                with open(pz_path, "w", encoding="utf-8") as f:
+                    json.dump(pz_out, f, indent=2)
+                st.success("Player zones saved!")
+                st.rerun()
+            else:
+                st.warning("Near, Far 각각 4개 점을 모두 클릭하세요.")
+
+
+def _draw_zone_overlay(frame0_path: Path, zones: list[dict], out_path: Path) -> None:
+    """Draw zone polygons (or rectangles) on frame0 for preview."""
+    import cv2
+    import numpy as np
+
+    frame = cv2.imread(str(frame0_path))
+    if frame is None:
+        return
+    colors = {"near": (255, 0, 0), "far": (0, 0, 255)}
+    for z in zones:
+        c = colors.get(z.get("label", ""), (0, 255, 0))
+        poly = z.get("polygon")
+        if poly and len(poly) >= 3:
+            pts = np.array(poly, dtype=np.int32)
+            overlay = frame.copy()
+            cv2.fillPoly(overlay, [pts], c)
+            frame = cv2.addWeighted(overlay, 0.2, frame, 0.8, 0)
+            cv2.polylines(frame, [pts], True, c, 2)
+            cv2.putText(frame, z.get("label", ""), (pts[0][0] + 5, pts[0][1] + 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, c, 2)
+        else:
+            r = z.get("rect", {})
+            if r.get("w", 0) <= 0 or r.get("h", 0) <= 0:
+                continue
+            overlay = frame.copy()
+            cv2.rectangle(overlay, (r["x"], r["y"]),
+                          (r["x"] + r["w"], r["y"] + r["h"]), c, -1)
+            frame = cv2.addWeighted(overlay, 0.2, frame, 0.8, 0)
+            cv2.rectangle(frame, (r["x"], r["y"]),
+                          (r["x"] + r["w"], r["y"] + r["h"]), c, 2)
+            cv2.putText(frame, z.get("label", ""), (r["x"] + 5, r["y"] + 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, c, 2)
+    cv2.imwrite(str(out_path), frame)
 
 
 def _regenerate_overlay(frame0_path: Path, polygon: list, art: Path) -> None:
@@ -1327,13 +1559,14 @@ def _export_single_clip(
     duration = clip_end - clip_start
 
     if fmt == "video":
+        from tt_highlights.runtime import get_video_encoder
+        config = _load_job_config()
+        venc_args = get_video_encoder(config)
         out_path = clips_dir / f"{safe_label}.mp4"
         cmd = [
             "ffmpeg", "-y",
             "-ss", str(clip_start), "-i", input_video, "-t", str(duration),
-            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-            "-pix_fmt", "yuv420p",
-            "-profile:v", "high", "-level", "4.1",
+            *venc_args,
             "-c:a", "aac", "-b:a", "192k",
             "-movflags", "+faststart",
             str(out_path),
@@ -1460,6 +1693,506 @@ def _extract_preview_clip(
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {result.stderr[:200]}")
+
+
+# ─── Step override filtering ──────────────────────────────────────────────────
+
+_STEP_OVERRIDE_KEYS = {
+    "audio_events": {"audio"},
+    "video_activity": {"video"},
+    "rally_segment": {"segmentation"},
+    "scoreboard_ocr": {"ocr"},
+    "ball_tracking": {"ball"},
+    "player_motion": {"player_motion"},
+    "pose_estimation": {"pose_estimation"},
+    "features": set(),
+    "scoring": set(),
+}
+
+
+def _filter_override_for_step(config_override: dict, step_name: str) -> dict:
+    """Return only the override keys relevant to a specific step."""
+    allowed_keys = _STEP_OVERRIDE_KEYS.get(step_name, set())
+    if not allowed_keys:
+        return {}
+    return {k: v for k, v in config_override.items() if k in allowed_keys}
+
+
+# ─── Inspector Panels ─────────────────────────────────────────────────────────
+
+
+def _render_inspector_panels(rally_id: int, art: Path) -> None:
+    """Render Debug Panel, Rally Inspector, and Calibration Mode for a rally."""
+    from tt_highlights.inspector import (
+        load_rally_inspector, PoseStatus, OcrStatus,
+    )
+
+    inspector_data = load_rally_inspector(st.session_state.job_path, rally_id)
+    _render_debug_panel(inspector_data, PoseStatus, OcrStatus)
+
+    with st.expander("Rally Inspector", expanded=False):
+        _render_rally_inspector(inspector_data, rally_id, art, PoseStatus)
+
+    with st.expander("Calibration Mode", expanded=False):
+        _render_calibration_mode(rally_id, art)
+
+
+def _render_debug_panel(data: dict, PoseStatus, OcrStatus) -> None:
+    """Render the quick-glance debug panel with metrics and warnings."""
+    summary = data.get("summary")
+    if summary is None:
+        st.warning("No rally data available")
+        return
+
+    st.subheader(f"Debug Panel \u2014 Rally {summary['rally_id']}")
+
+    # Row 1: key metrics
+    pose = data.get("pose")
+    ocr = data.get("ocr", {})
+    scores = data.get("scores")
+
+    pose_status_val = "N/A"
+    if pose:
+        ps = pose["status"]
+        pose_status_val = ps.value if isinstance(ps, PoseStatus) else str(ps)
+    ocr_status_val = ocr.get("status", OcrStatus.UNAVAILABLE)
+    if isinstance(ocr_status_val, OcrStatus):
+        ocr_status_val = ocr_status_val.value
+
+    top_cat = scores["top_category"] if scores else "N/A"
+    seg_score = (
+        f"{summary['segment_score']:.2f}"
+        if summary.get("segment_score") is not None else "N/A"
+    )
+    swing_diff = f"{pose['swing_count_diff']:.0f}" if pose else "N/A"
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Rally ID", summary["rally_id"])
+    c2.metric("Segment Score", seg_score)
+    c3.metric("Top Category", top_cat)
+    c4.metric("Pose Status", pose_status_val)
+    c5.metric("OCR Status", ocr_status_val)
+    c6.metric("Swing Count Diff", swing_diff)
+
+    # Row 2: motion/pose details
+    motion = data.get("motion")
+    near_mean = f"{motion['near']['raw_mean']:.4f}" if motion else "N/A"
+    far_mean = f"{motion['far']['raw_mean']:.4f}" if motion else "N/A"
+    wrist_peak = (
+        f"{pose['near']['wrist_speed_peak']:.4f}"
+        if pose and pose.get("near") else "N/A"
+    )
+    pose_asym = f"{pose['asymmetry']:.4f}" if pose else "N/A"
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Near Motion Mean", near_mean)
+    c2.metric("Far Motion Mean", far_mean)
+    c3.metric("Near Wrist Speed Peak", wrist_peak)
+    c4.metric("Pose Asymmetry", pose_asym)
+
+    # Row 3: top reasons
+    if scores and scores.get("top_reasons"):
+        st.markdown("**Top Reasons:** " + ", ".join(scores["top_reasons"]))
+
+    # Row 4: per-step freshness badges (compact one-line view)
+    freshness = data.get("freshness", {})
+    artifacts_info = freshness.get("artifacts", {})
+    if artifacts_info:
+        badges = []
+        for name, info in artifacts_info.items():
+            if not info["exists"]:
+                badges.append(f"`{name}` missing")
+            elif info["stale"]:
+                badges.append(f"`{name}` stale")
+            else:
+                badges.append(f"`{name}` ok")
+        st.markdown("**Artifact status:** " + " | ".join(badges))
+
+    # Row 5: freshness warnings (details)
+    for w in freshness.get("warnings", []):
+        st.warning(w)
+
+    # Row 6: status messages (skip duplicates from freshness)
+    freshness_warnings = set(freshness.get("warnings", []))
+    for msg in data.get("status_messages", []):
+        if msg not in freshness_warnings:
+            st.info(msg)
+
+
+def _render_rally_inspector(data: dict, rally_id: int, art: Path, PoseStatus) -> None:
+    """Render the detailed Rally Inspector panel."""
+    summary = data.get("summary")
+    if summary is None:
+        st.warning("No rally data")
+        return
+
+    # ── Summary table ──
+    st.subheader("Summary")
+    summary_rows = {
+        "Start (s)": summary["start"],
+        "End (s)": summary["end"],
+        "Duration (s)": summary["duration"],
+        "Impact Count": summary["impact_count"],
+        "Impact Rate (/s)": summary["impact_rate"],
+        "Impact Peak": summary["impact_peak"],
+        "Activity Mean": summary["activity_mean"],
+        "Activity Peak": summary["activity_peak"],
+    }
+
+    motion = data.get("motion")
+    if motion:
+        summary_rows.update({
+            "Near Motion Mean": motion["near"]["raw_mean"],
+            "Far Motion Mean": motion["far"]["raw_mean"],
+            "Near End Burst": motion["near"]["raw_end_burst"],
+            "Far End Burst": motion["far"]["raw_end_burst"],
+            "Motion Asymmetry": motion["asymmetry"],
+        })
+
+    pose = data.get("pose")
+    if pose and pose.get("near"):
+        summary_rows.update({
+            "Near Wrist Speed Peak": pose["near"]["wrist_speed_peak"],
+            "Far Wrist Speed Peak": pose.get("far", {}).get("wrist_speed_peak", 0),
+            "Near Arm Extension Peak": pose["near"]["arm_extension_peak"],
+            "Pose Asymmetry": pose["asymmetry"],
+            "Swing Count Diff": pose["swing_count_diff"],
+        })
+
+    ocr = data.get("ocr", {})
+    ocr_status = ocr.get("status")
+    if hasattr(ocr_status, "value"):
+        ocr_status = ocr_status.value
+    summary_rows["OCR Status"] = ocr_status or "N/A"
+
+    import pandas as pd
+    df = pd.DataFrame(
+        [{"Metric": k, "Value": v} for k, v in summary_rows.items()]
+    )
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    # ── Score Breakdown ──
+    scores = data.get("scores")
+    if scores and scores.get("categories"):
+        st.subheader("Score Breakdown")
+        _render_score_breakdown(scores)
+
+    # ── Event Timeline ──
+    events = data.get("events")
+    if events:
+        st.subheader("Event Timeline")
+        _render_event_timeline(events, summary["start"], summary["end"])
+
+    # ── Rally Frame Preview (with skeleton insets) ──
+    st.subheader("Rally Frame Preview")
+    _render_rally_frames(rally_id, art, summary, count=3, include_skeletons=True)
+
+
+def _render_score_breakdown(scores: dict) -> None:
+    """Render a bar chart of score contributions per category."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    categories = scores.get("categories", {})
+    if not categories:
+        return
+
+    fig, axes = plt.subplots(
+        1, len(categories), figsize=(5 * len(categories), 4),
+    )
+    if len(categories) == 1:
+        axes = [axes]
+
+    for ax, (cat, info) in zip(axes, categories.items()):
+        reasons = info.get("reasons", [])
+        if not reasons:
+            ax.set_title(f"{cat}: {info['score']:.2f}")
+            continue
+
+        features = [r.get("feature", "?") for r in reasons]
+        contribs = [r.get("contribution", 0) for r in reasons]
+        colors = ["#4CAF50" if c > 0 else "#F44336" for c in contribs]
+
+        ax.barh(features, contribs, color=colors, alpha=0.8)
+        ax.set_title(f"{cat}: {info['score']:.2f}")
+        ax.set_xlabel("Contribution")
+
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+def _render_event_timeline(
+    events: dict, rally_start: float, rally_end: float,
+) -> None:
+    """Render an event timeline plot for one rally."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(14, 2.5))
+
+    # Rally bounds
+    ax.axvline(rally_start, color="green", linestyle="-", linewidth=2,
+               label="Rally bounds")
+    ax.axvline(rally_end, color="green", linestyle="-", linewidth=2)
+
+    # Impacts
+    for imp in events.get("impacts", []):
+        ax.axvline(imp["t"], color="red", linestyle=":", alpha=0.5, linewidth=1)
+    if events.get("impacts"):
+        # Re-draw first one with label for legend
+        ax.axvline(events["impacts"][0]["t"], color="red", linestyle=":",
+                    alpha=0.5, label="Impacts")
+
+    # OCR events
+    for ocr in events.get("ocr", []):
+        ax.axvline(ocr["t"], color="blue", linestyle="-", alpha=0.6,
+                    linewidth=1.5)
+    if events.get("ocr"):
+        ax.axvline(events["ocr"][0]["t"], color="blue", linestyle="-",
+                    alpha=0.6, label="OCR event")
+
+    # Cheer segments
+    for ch in events.get("cheers", []):
+        ax.axvspan(ch["start"], ch["end"], color="gold", alpha=0.2)
+    if events.get("cheers"):
+        ax.axvspan(events["cheers"][0]["start"], events["cheers"][0]["end"],
+                    color="gold", alpha=0.2, label="Cheer")
+
+    ax.set_xlim(rally_start - 0.5, rally_end + 0.5)
+    ax.set_xlabel("Time (s)")
+    ax.set_yticks([])
+    ax.legend(loc="upper right", fontsize=8)
+    ax.set_title("Event Timeline")
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+def _render_rally_frames(
+    rally_id: int, art: Path, summary: dict, count: int,
+    include_skeletons: bool = True,
+) -> None:
+    """Extract and display rally frames with zone + skeleton overlays."""
+    from tt_highlights.inspector import (
+        extract_rally_frames, list_pose_debug_samples,
+    )
+
+    dbg = debug_dir(st.session_state.job_path)
+    proxy_path = art / "proxy.mp4"
+    if not proxy_path.exists():
+        st.caption("proxy.mp4 not found")
+        return
+
+    # Load zone and geometry data
+    zones = None
+    zones_path = art / "player_zones.json"
+    if zones_path.exists():
+        with open(zones_path, "r") as f:
+            zones_data = json.load(f)
+        zones = zones_data.get("zones")
+
+    table_polygon = None
+    roi_path = art / "table_roi.json"
+    if roi_path.exists():
+        with open(roi_path, "r") as f:
+            roi_data = json.load(f)
+        table_polygon = roi_data.get("table_polygon")
+
+    scoreboard_rect = None
+    sb_path = art / "scoreboard_roi.json"
+    if sb_path.exists():
+        with open(sb_path, "r") as f:
+            sb_data = json.load(f)
+        scoreboard_rect = sb_data.get("rect")
+
+    # Load skeleton samples if requested (composited as insets on frames)
+    skeleton_samples = None
+    if include_skeletons:
+        skeleton_samples = list_pose_debug_samples(
+            st.session_state.job_path, rally_id,
+        ) or None
+
+    frames = extract_rally_frames(
+        proxy_path=proxy_path,
+        rally_start=summary["start"],
+        rally_end=summary["end"],
+        rally_id=rally_id,
+        count=count,
+        cache_dir=dbg / "inspector_frames",
+        zones=zones,
+        table_polygon=table_polygon,
+        scoreboard_rect=scoreboard_rect,
+        skeleton_samples=skeleton_samples,
+    )
+
+    if frames:
+        cols = st.columns(len(frames))
+        for i, fr in enumerate(frames):
+            with cols[i]:
+                st.image(str(fr["path"]), caption=f"t={fr['t']:.1f}s")
+        if skeleton_samples:
+            st.caption("Skeleton insets shown in zone corners (nearest-time match)")
+    else:
+        st.caption("Could not extract frames")
+
+
+def _render_calibration_mode(rally_id: int, art: Path) -> None:
+    """Render the Calibration Mode panel."""
+    from tt_highlights.inspector import build_calibration_series
+
+    cal_data = build_calibration_series(st.session_state.job_path, rally_id)
+
+    # Pose valid frame ratio caption
+    st.caption(
+        f"Pose valid frames: near {cal_data['near_pose_valid_ratio']:.0%}, "
+        f"far {cal_data['far_pose_valid_ratio']:.0%}"
+    )
+
+    # Time-series plot
+    _render_calibration_plot(cal_data)
+
+    # Rally Frame Preview (5 frames)
+    st.subheader("Rally Frame Preview")
+    rallies_data = None
+    rallies_path = art / "rallies.json"
+    if rallies_path.exists():
+        with open(rallies_path, "r") as f:
+            rallies_data = json.load(f)
+
+    summary_info = None
+    if rallies_data:
+        for r in rallies_data.get("rallies", []):
+            if r["id"] == rally_id:
+                summary_info = {
+                    "start": r["start"],
+                    "end": r.get("end_refined", r["end"]),
+                }
+                break
+
+    if summary_info:
+        _render_rally_frames(rally_id, art, summary_info, count=5)
+
+    # Parameter readback
+    st.subheader("Current Parameters")
+    st.json(cal_data["params"])
+
+
+def _render_calibration_plot(cal_data: dict) -> None:
+    """Render the multi-signal calibration time-series plot."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    rally_start = cal_data["rally_window"]["start"]
+    rally_end = cal_data["rally_window"]["end"]
+
+    fig, ax1 = plt.subplots(figsize=(14, 5))
+    ax2 = ax1.twinx()
+
+    # Left Y (0-1): activity + motion
+    activity = cal_data.get("activity", [])
+    if activity:
+        at = [s["t"] for s in activity]
+        av = [s["value"] for s in activity]
+        ax1.plot(at, av, "k-", label="Activity", alpha=0.5, linewidth=0.8)
+
+    near_motion = cal_data.get("near_motion", [])
+    if near_motion:
+        mt = [s["t"] for s in near_motion]
+        mv = [s["value"] for s in near_motion]
+        ax1.plot(mt, mv, "b-", label="Near Motion", linewidth=1)
+
+    far_motion = cal_data.get("far_motion", [])
+    if far_motion:
+        mt = [s["t"] for s in far_motion]
+        mv = [s["value"] for s in far_motion]
+        ax1.plot(mt, mv, "r-", label="Far Motion", linewidth=1)
+
+    ax1.set_ylabel("Activity / Motion")
+    ax1.set_xlabel("Time (s)")
+
+    # Right Y: pose wrist speed curves
+    near_pose = cal_data.get("near_pose", [])
+    if near_pose:
+        pt = [s["t"] for s in near_pose]
+        pv = [s["wrist_speed"] for s in near_pose]
+        ax2.plot(pt, pv, "b--", label="Near Wrist Speed", alpha=0.7,
+                 linewidth=1)
+
+    far_pose = cal_data.get("far_pose", [])
+    if far_pose:
+        pt = [s["t"] for s in far_pose]
+        pv = [s["wrist_speed"] for s in far_pose]
+        ax2.plot(pt, pv, "r--", label="Far Wrist Speed", alpha=0.7,
+                 linewidth=1)
+
+    ax2.set_ylabel("Wrist Speed (normalized)")
+
+    # Pose missing-gap shading (use actual sample fps from data)
+    pose_fps = cal_data.get("pose_sample_fps", 5)
+    if near_pose:
+        _shade_pose_gaps(ax1, [s["t"] for s in near_pose],
+                         rally_start, rally_end, color="blue", alpha=0.05,
+                         pose_sample_fps=pose_fps)
+    if far_pose:
+        _shade_pose_gaps(ax1, [s["t"] for s in far_pose],
+                         rally_start, rally_end, color="red", alpha=0.05,
+                         pose_sample_fps=pose_fps)
+    if not near_pose and not far_pose:
+        ax1.axvspan(rally_start, rally_end, color="gray", alpha=0.1)
+
+    # Vertical markers
+    for imp in cal_data.get("impacts", []):
+        ax1.axvline(imp["t"], color="red", linestyle=":", alpha=0.4,
+                     linewidth=0.8)
+
+    ocr_event = cal_data.get("ocr_event")
+    if ocr_event:
+        ax1.axvline(ocr_event["t"], color="blue", linestyle="-", alpha=0.6,
+                     linewidth=1.5)
+
+    # Rally bounds
+    ax1.axvline(rally_start, color="green", linestyle="-", linewidth=1.5)
+    ax1.axvline(rally_end, color="green", linestyle="-", linewidth=1.5)
+
+    # Cheer segments
+    for ch in cal_data.get("cheers", []):
+        ax1.axvspan(ch["start"], ch["end"], color="gold", alpha=0.15)
+
+    # Combined legend
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2,
+               loc="upper left", fontsize=8)
+
+    ax1.set_title("Calibration: Activity + Motion + Pose")
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+def _shade_pose_gaps(ax, pose_times, rally_start, rally_end, color, alpha,
+                     pose_sample_fps=5):
+    """Shade time gaps where pose detection was missing."""
+    if not pose_times:
+        ax.axvspan(rally_start, rally_end, color="gray", alpha=0.1)
+        return
+    expected_interval = 1.0 / max(pose_sample_fps, 1)
+    gap_threshold = expected_interval * 3
+    # Gap at start
+    if pose_times[0] - rally_start > gap_threshold:
+        ax.axvspan(rally_start, pose_times[0], color=color, alpha=alpha)
+    # Inter-sample gaps
+    for i in range(1, len(pose_times)):
+        if pose_times[i] - pose_times[i - 1] > gap_threshold:
+            ax.axvspan(pose_times[i - 1], pose_times[i],
+                        color=color, alpha=alpha)
+    # Gap at end
+    if rally_end - pose_times[-1] > gap_threshold:
+        ax.axvspan(pose_times[-1], rally_end, color=color, alpha=alpha)
 
 
 main()

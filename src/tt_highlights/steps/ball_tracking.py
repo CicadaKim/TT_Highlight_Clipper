@@ -1,4 +1,8 @@
-"""Step: ball_tracking – detect and track ball in rally segments (optional, quality-gated)."""
+"""Step: ball_tracking – detect and track ball across entire video (optional, quality-gated).
+
+Produces:
+  - ball_tracks.json with full-video time-series samples + optional per-rally tracks
+"""
 
 import json
 import logging
@@ -27,24 +31,23 @@ def run(job: dict, config: dict, job_path: str) -> None:
 
     # Load required artifacts
     roi_path = art / "table_roi.json"
-    rallies_path = art / "rallies.json"
     proxy_path = art / "proxy.mp4"
 
-    if not roi_path.exists() or not rallies_path.exists() or not proxy_path.exists():
-        logger.warning("Missing required artifacts. Skipping ball tracking.")
+    if not roi_path.exists() or not proxy_path.exists():
+        logger.warning("Missing required artifacts (table_roi or proxy). Skipping ball tracking.")
         _write_disabled(art)
         return
 
     with open(roi_path, "r", encoding="utf-8") as f:
         roi_data = json.load(f)
-    with open(rallies_path, "r", encoding="utf-8") as f:
-        rallies_data = json.load(f)
 
-    rallies = rallies_data["rallies"]
-    if not rallies:
-        logger.info("No rallies to track. Writing empty ball tracks.")
-        _write_empty(art)
-        return
+    # rallies.json is optional — used for backward-compat per-rally tracks
+    rallies_path = art / "rallies.json"
+    rallies = []
+    if rallies_path.exists():
+        with open(rallies_path, "r", encoding="utf-8") as f:
+            rallies_data = json.load(f)
+        rallies = rallies_data.get("rallies", [])
 
     polygon = np.array(roi_data["table_polygon"], dtype=np.float32)
     warp_w = config["video"]["warp_width"]
@@ -67,108 +70,127 @@ def run(job: dict, config: dict, job_path: str) -> None:
 
     cap = cv2.VideoCapture(str(proxy_path))
     video_fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if video_fps <= 0:
         video_fps = 30.0
 
     frame_interval = max(1, int(round(video_fps / detection_fps)))
+    actual_fps = video_fps / frame_interval
+    duration = total_frames / video_fps
 
-    tracks = []
+    logger.info(
+        f"Ball tracking: full-video scan, {total_frames} frames, "
+        f"interval={frame_interval}, ~{duration:.1f}s"
+    )
 
-    for rally in rallies:
-        rid = rally["id"]
-        r_start = rally["start"]
-        r_end = rally.get("end_refined", rally["end"])
+    # ── Full-video scan ───────────────────────────────────────────────────
+    prev_gray = None
+    samples = []
+    frame_idx = 0
 
-        logger.info(f"Tracking ball in rally {rid}: [{r_start:.1f}-{r_end:.1f}]")
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-        start_frame = int(r_start * video_fps)
-        end_frame = int(r_end * video_fps)
+        if frame_idx % frame_interval == 0:
+            t = frame_idx / video_fps
 
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            warped = cv2.warpPerspective(frame, H, (warp_w, warp_h))
+            gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
 
-        prev_gray = None
-        detections = []
-        total_frames_checked = 0
-        frame_idx = start_frame
+            detected = False
+            best_cx, best_cy, best_conf = 0.0, 0.0, 0.0
 
-        while frame_idx <= end_frame:
-            ret, frame = cap.read()
-            if not ret:
-                break
+            if prev_gray is not None:
+                diff = cv2.absdiff(gray, prev_gray)
+                _, binary = cv2.threshold(diff, diff_threshold, 255, cv2.THRESH_BINARY)
 
-            if (frame_idx - start_frame) % frame_interval == 0:
-                total_frames_checked += 1
-                t = frame_idx / video_fps
+                contours, _ = cv2.findContours(
+                    binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
 
-                warped = cv2.warpPerspective(frame, H, (warp_w, warp_h))
-                gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+                for cnt in contours:
+                    area = cv2.contourArea(cnt)
+                    if area < min_area or area > max_area:
+                        continue
 
-                if prev_gray is not None:
-                    diff = cv2.absdiff(gray, prev_gray)
-                    _, binary = cv2.threshold(diff, diff_threshold, 255, cv2.THRESH_BINARY)
+                    perimeter = cv2.arcLength(cnt, True)
+                    if perimeter == 0:
+                        continue
+                    circularity = 4 * math.pi * area / (perimeter ** 2)
+                    if circularity < min_circularity:
+                        continue
 
-                    # Find blob candidates
-                    contours, _ = cv2.findContours(
-                        binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-                    )
+                    x, y, w, h = cv2.boundingRect(cnt)
+                    aspect = max(w, h) / max(min(w, h), 1)
+                    if aspect > max_aspect_ratio:
+                        continue
 
-                    for cnt in contours:
-                        area = cv2.contourArea(cnt)
-                        if area < min_area or area > max_area:
-                            continue
+                    cx = x + w / 2
+                    cy = y + h / 2
+                    conf = circularity * min(1.0, area / max_area)
 
-                        perimeter = cv2.arcLength(cnt, True)
-                        if perimeter == 0:
-                            continue
-                        circularity = 4 * math.pi * area / (perimeter ** 2)
-                        if circularity < min_circularity:
-                            continue
+                    if conf > best_conf:
+                        detected = True
+                        best_cx, best_cy, best_conf = cx, cy, conf
 
-                        x, y, w, h = cv2.boundingRect(cnt)
-                        aspect = max(w, h) / max(min(w, h), 1)
-                        if aspect > max_aspect_ratio:
-                            continue
+            sample = {"t": round(t, 3), "detected": detected}
+            if detected:
+                sample["x"] = round(best_cx, 1)
+                sample["y"] = round(best_cy, 1)
+                sample["conf"] = round(best_conf, 3)
+            samples.append(sample)
 
-                        cx = x + w / 2
-                        cy = y + h / 2
-                        conf = circularity * min(1.0, area / max_area)
+            prev_gray = gray
 
-                        detections.append({
-                            "t": round(t, 3),
-                            "x": round(cx, 1),
-                            "y": round(cy, 1),
-                            "conf": round(conf, 3),
-                        })
-
-                prev_gray = gray
-
-            frame_idx += 1
-
-        # Simple nearest-neighbor tracking
-        best_track = _simple_track(detections, max_jump_px, max_misses)
-
-        # Quality: detection ratio
-        quality = len(best_track) / max(total_frames_checked, 1)
-
-        tracks.append({
-            "rally_id": rid,
-            "quality": round(quality, 4),
-            "best_track": best_track,
-        })
-
-        logger.info(f"  Rally {rid}: {len(best_track)} detections, "
-                     f"quality={quality:.3f}")
+        frame_idx += 1
 
     cap.release()
 
+    # ── Per-rally tracks (backward compat, only if rallies.json exists) ───
+    tracks = []
+    if rallies:
+        for rally in rallies:
+            rid = rally["id"]
+            r_start = rally["start"]
+            r_end = rally.get("end_refined", rally["end"])
+
+            # Filter samples within rally time window
+            rally_detections = [
+                s for s in samples
+                if r_start <= s["t"] <= r_end and s["detected"]
+            ]
+
+            total_in_window = sum(
+                1 for s in samples if r_start <= s["t"] <= r_end
+            )
+
+            # Simple nearest-neighbor tracking
+            best_track = _simple_track(rally_detections, max_jump_px, max_misses)
+            quality = len(best_track) / max(total_in_window, 1)
+
+            tracks.append({
+                "rally_id": rid,
+                "quality": round(quality, 4),
+                "best_track": best_track,
+            })
+
     output = {
         "enabled": True,
+        "fps": round(actual_fps, 2),
+        "samples": samples,
         "tracks": tracks,
     }
     with open(art / "ball_tracks.json", "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2)
 
-    logger.info(f"Ball tracking done: {len(tracks)} rally tracks.")
+    detected_count = sum(1 for s in samples if s["detected"])
+    logger.info(
+        f"Ball tracking done: {len(samples)} samples, "
+        f"{detected_count} detections ({detected_count / max(len(samples), 1):.1%}), "
+        f"{len(tracks)} rally tracks."
+    )
 
 
 def _simple_track(detections: list[dict], max_jump: float,
@@ -223,13 +245,6 @@ def _simple_track(detections: list[dict], max_jump: float,
 
 def _write_disabled(art: Path) -> None:
     """Write disabled ball_tracks.json."""
-    output = {"enabled": False, "tracks": []}
-    with open(art / "ball_tracks.json", "w", encoding="utf-8") as f:
-        json.dump(output, f, indent=2)
-
-
-def _write_empty(art: Path) -> None:
-    """Write enabled but empty ball_tracks.json."""
-    output = {"enabled": True, "tracks": []}
+    output = {"enabled": False, "fps": 0, "samples": [], "tracks": []}
     with open(art / "ball_tracks.json", "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2)

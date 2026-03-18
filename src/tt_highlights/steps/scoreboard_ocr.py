@@ -40,12 +40,33 @@ def run(job: dict, config: dict, job_path: str) -> None:
         _write_disabled(art)
         return
 
+    # Scale scoreboard coordinates from original to proxy resolution
+    from ..job import proxy_scale
+    psx, psy = proxy_scale(job_path)
+
     rect = sb_data["rect"]
-    rx, ry, rw, rh = rect["x"], rect["y"], rect["w"], rect["h"]
+    rx = int(rect["x"] * psx)
+    ry = int(rect["y"] * psy)
+    rw = int(rect["w"] * psx)
+    rh = int(rect["h"] * psy)
     if rw <= 0 or rh <= 0:
         logger.info("Scoreboard ROI has zero size. Skipping OCR.")
         _write_disabled(art)
         return
+
+    # Build perspective warp from polygon if available (handles tilted scoreboards)
+    sb_polygon = sb_data.get("polygon")
+    sb_warp_matrix = None
+    if sb_polygon and len(sb_polygon) == 4:
+        import numpy as np
+        src_pts = np.array(
+            [[int(p[0] * psx), int(p[1] * psy)] for p in sb_polygon],
+            dtype=np.float32,
+        )
+        dst_pts = np.array(
+            [[0, 0], [rw, 0], [rw, rh], [0, rh]], dtype=np.float32,
+        )
+        sb_warp_matrix = cv2.getPerspectiveTransform(src_pts, dst_pts)
 
     # Load rallies
     with open(art / "rallies.json", "r", encoding="utf-8") as f:
@@ -97,8 +118,11 @@ def run(job: dict, config: dict, job_path: str) -> None:
                 t += sample_interval
                 continue
 
-            # Crop ROI
-            roi = frame[ry:ry + rh, rx:rx + rw]
+            # Crop ROI (use perspective warp if polygon available)
+            if sb_warp_matrix is not None:
+                roi = cv2.warpPerspective(frame, sb_warp_matrix, (rw, rh))
+            else:
+                roi = frame[ry:ry + rh, rx:rx + rw]
             if roi.size == 0:
                 t += sample_interval
                 continue
@@ -179,10 +203,18 @@ def _find_score_change(timeline: list[dict], rally_id: int) -> dict | None:
             # Compute delta (try parsing as integers)
             delta = _parse_score_delta(before_mode, after_mode)
 
+            # Determine scorer side from delta
+            scorer_side = None
+            if delta[0] > 0 and delta[1] == 0:
+                scorer_side = "left"
+            elif delta[1] > 0 and delta[0] == 0:
+                scorer_side = "right"
+
             return {
                 "rally_id": rally_id,
                 "t": timeline[i]["t"],
                 "delta": delta,
+                "scorer_side": scorer_side,
                 "confidence": round(confidence, 3),
             }
 

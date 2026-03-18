@@ -1,0 +1,10 @@
+# GPU extras — install on top of base requirements.txt
+# pip install -r requirements.txt -r requirements-gpu.txt
+
+# PyTorch with CUDA (user should pick the right CUDA version)
+# See https://pytorch.org/get-started/locally/
+torch>=2.0
+torchvision>=0.15
+
+# YOLOv8 for pose estimation (Phase 4)
+ultralytics>=8.1

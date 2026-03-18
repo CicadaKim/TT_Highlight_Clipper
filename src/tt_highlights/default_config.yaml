@@ -1,3 +1,9 @@
+runtime:
+  device: cuda          # "auto" | "cpu" | "cuda" | "cuda:0" etc.
+  gpu_batch_size: 16
+  num_decode_workers: 2
+  prefer_nvenc: true    # use NVENC for ffmpeg export when available
+
 video:
   proxy_height: 720
   proxy_fps: 30
@@ -38,6 +44,10 @@ segmentation:
   require_video_confirmation: false
   video_confirm_window_sec: 0.5
   video_confirm_threshold: 0.03
+  ball_conf_weight: 0.15
+  motion_conf_weight: 0.10
+  ball_conf_window_sec: 0.5
+  motion_conf_threshold: 2.0
 
 ocr:
   enabled: true
@@ -57,6 +67,26 @@ ball:
   max_jump_px: 45
   max_misses: 7
   quality_min_ratio: 0.4
+
+player_zones:
+  enabled: true
+  auto_derive: true     # auto-derive from table polygon short edges
+  margin_px: 150        # zone expansion beyond table edge (or 20% of frame height)
+  sample_fps: 10
+
+player_motion:
+  enabled: true
+  sample_fps: 10
+  smoothing_window: 5
+
+pose_estimation:
+  enabled: true         # requires ultralytics (GPU extras)
+  model_size: "s"       # "n" (nano) or "s" (small, more accurate)
+  sample_fps: 5         # YOLO is heavier than motion, so lower
+  conf_threshold: 0.5   # person detection minimum confidence
+  swing_speed_norm: "shoulder_width"
+  swing_speed_threshold: 0.8
+  smoothing_window: 3
 
 clips:
   total: 10
@@ -91,12 +121,16 @@ scoring:
       impact_count: 0.7
       activity_mean: 0.5
       ball_coverage_entropy: 0.4
+      wrist_speed_mean: 0.0    # pose: enable after validation
     impact:
       impact_peak: 1.2
       activity_peak: 0.8
       ball_speed_peak: 0.9
       ball_accel_spikes: 0.5
+      wrist_speed_peak: 0.0   # pose: enable after validation
+      arm_extension_peak: 0.0 # pose: enable after validation
     reaction:
       cheer_near_end: 1.5
       ocr_score_change: 1.8
       post_pause: 0.4
+      pose_asymmetry: 0.0     # pose: enable after validation

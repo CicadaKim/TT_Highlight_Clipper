@@ -58,7 +58,7 @@ function setFrameHeight(h) {
 
 /* ── State ───────────────────────────────────────────────────────── */
 const COLORS = ["#ff4b4b", "#4bff4b", "#4b8bff", "#ffff4b"];
-const MAX_PTS = 4;
+let MAX_PTS = 4;
 
 let points = [];
 let scale = 1;
@@ -107,8 +107,8 @@ function draw() {
   }
 
   statusEl.textContent = points.length < MAX_PTS
-    ? `Click point ${points.length} of ${MAX_PTS}`
-    : "4 points set — Save Table ROI to apply";
+    ? `Click point ${points.length + 1} of ${MAX_PTS}`
+    : `${MAX_PTS} points set — click Save to apply`;
   btnUndo.disabled = points.length === 0;
 }
 
@@ -144,6 +144,11 @@ window.addEventListener("message", (event) => {
     img.src = currentSrc;
   }
 
+  // Accept max_points from args
+  if (args.max_points && Number.isInteger(args.max_points) && args.max_points > 0) {
+    MAX_PTS = args.max_points;
+  }
+
   // Load initial points only on very first render
   if (!initialized) {
     initialized = true;
@@ -157,7 +162,11 @@ window.addEventListener("message", (event) => {
 img.addEventListener("load", () => {
   imgLoaded = true;
   draw();
-  setTimeout(() => setFrameHeight(), 100);
+  // Set height based on actual rendered image + toolbar
+  setTimeout(() => {
+    var h = img.clientHeight + 50;
+    setFrameHeight(Math.max(h, 400));
+  }, 150);
 });
 
 window.addEventListener("resize", () => { if (imgLoaded) draw(); });
